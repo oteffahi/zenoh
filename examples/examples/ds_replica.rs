@@ -73,7 +73,7 @@ async fn main() {
                     println!(">> [FILE] Stored file {}", hash_string.get(0..5).unwrap());
 
                     // compute digest
-                    let signature = "PLACEHOLDER_SIGNATURE";
+                    let signature = format!("PLACEHOLDER_SIGNATURE_{}", zid);
 
                     // send digest
                     // TODO: proper serialization
