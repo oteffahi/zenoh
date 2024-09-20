@@ -26,7 +26,6 @@ async fn main() {
     let mut local_store: HashMap<String, Vec<u8>> = HashMap::new();
     let mut digest_store: HashMap<String, HashSet<String>> = HashMap::new();
 
-    let queryable_store_keyexpr = KeyExpr::new("DS/STORE").unwrap();
     let sub_file_keyexpr = KeyExpr::new("DS/FILE").unwrap();
     let sub_digest_keyexpr = KeyExpr::new("DS/DIGEST").unwrap();
 
@@ -38,6 +37,9 @@ async fn main() {
     println!("Opening session...");
     let session = zenoh::open(config).await.unwrap();
 
+    // to avoid broadcasting the same file multiple times, need to have a way to target only one queryable in the network
+    let zid = session.info().zid().await.to_string();
+    let queryable_store_keyexpr = KeyExpr::new(format!("DS/STORE/{zid}")).unwrap();
     let queryable_store = session
         .declare_queryable(&queryable_store_keyexpr)
         .await
@@ -54,6 +56,7 @@ async fn main() {
     loop {
         select! {
             Ok(file_sample) = sub_file.recv_async() => {
+                println!();
                 println!(">> [FILE] Received sample");
                 if file_sample.payload().len() > 0 {
                     let file = file_sample.payload().deserialize::<Vec<u8>>().unwrap();
@@ -61,9 +64,9 @@ async fn main() {
                     // compute hash
                     let mut hasher = Keccak256::new();
                     hasher.update(&file);
-                    let mut hash: Vec<u8> = Vec::new();
+                    let mut hash = [0u8; 64];
                     hex::encode_to_slice(hasher.finalize(), &mut hash).unwrap();
-                    let hash_string = String::from_utf8(hash).unwrap();
+                    let hash_string = String::from_utf8(hash.to_vec()).unwrap();
 
                     // store in kvs
                     local_store.insert(hash_string.to_string(), file);
@@ -84,17 +87,20 @@ async fn main() {
             }
 
             Ok(file_query) = queryable_store.recv_async() => {
+                println!();
                 println!(">> [STORE] Received upload request");
                 match file_query.payload() {
-                    None => {
+                    Some(file_payload) if file_payload.len() > 0 => {
+                        session.put(&sub_file_keyexpr, file_payload).await.unwrap();
+                    }
+                    _ => {
+                        println!(">> [STORE] Skipping empty request");
                         // handle error
                         file_query
                             .reply_err("File payload should not be empty")
                             .await
                             .unwrap();
-                    }
-                    Some(file_payload) => {
-                        session.put(&sub_file_keyexpr, file_payload).await.unwrap();
+                        continue;
                     }
                 }
                 let response = "OK".to_string();
@@ -110,6 +116,7 @@ async fn main() {
             }
 
             Ok(digest_sample) = sub_digest.recv_async() => {
+                println!();
                 println!(">> [DIGEST] Received sample");
                 if digest_sample.payload().len() > 0 {
                     // TODO: proper deserialization

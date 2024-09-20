@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use zenoh::{
+    config::ZenohId,
     query::{QueryTarget, Selector},
     Config,
 };
@@ -25,21 +26,24 @@ async fn main() {
     // initiate logging
     zenoh::init_log_from_env_or("error");
 
-    let (config, selector, payload, target, timeout) = parse_args();
+    let (config, _, payload, _, timeout) = parse_args();
 
     println!("Opening session...");
     let session = zenoh::open(config).await.unwrap();
 
+    // connected peers' ZIDs
+    let peers: Vec<ZenohId> = session.info().peers_zid().await.collect();
+    if peers.is_empty() {
+        println!("No peers in the network");
+        return;
+    }
+    // to avoid broadcasting the same file multiple times, need to have a way to target only one queryable in the network
+    let query_target = peers.get(0).unwrap().to_string();
+    let selector = format!("DS/STORE/{query_target}");
     println!("Sending Query '{selector}'...");
     let replies = session
         .get(&selector)
-        // // By default get receives replies from a FIFO.
-        // // Uncomment this line to use a ring channel instead.
-        // // More information on the ring channel are available in the z_pull example.
-        // .with(zenoh::handlers::RingChannel::default())
-        // Refer to z_bytes.rs to see how to serialize different types of message
         .payload(payload.unwrap_or_default())
-        .target(target)
         .timeout(timeout)
         .await
         .unwrap();
