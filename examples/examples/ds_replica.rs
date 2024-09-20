@@ -12,56 +12,138 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::Parser;
+use sha3::{Digest, Keccak256};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
+use tokio::select;
 use zenoh::{key_expr::KeyExpr, Config};
 use zenoh_examples::CommonArgs;
 
 #[tokio::main]
 async fn main() {
+    let mut local_store: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut digest_store: HashMap<String, HashSet<String>> = HashMap::new();
+
+    let queryable_store_keyexpr = KeyExpr::new("DS/STORE").unwrap();
+    let sub_file_keyexpr = KeyExpr::new("DS/FILE").unwrap();
+    let sub_digest_keyexpr = KeyExpr::new("DS/DIGEST").unwrap();
+
     // initiate logging
     zenoh::init_log_from_env_or("error");
 
-    let (config, key_expr, payload, complete) = parse_args();
+    let (config, ..) = parse_args();
 
     println!("Opening session...");
     let session = zenoh::open(config).await.unwrap();
 
-    println!("Declaring Queryable on '{key_expr}'...");
-    let queryable = session
-        .declare_queryable(&key_expr)
-        // // By default queryable receives queries from a FIFO.
-        // // Uncomment this line to use a ring channel instead.
-        // // More information on the ring channel are available in the z_pull example.
-        // .with(zenoh::handlers::RingChannel::default())
-        .complete(complete)
+    let queryable_store = session
+        .declare_queryable(&queryable_store_keyexpr)
+        .await
+        .unwrap();
+
+    let sub_file = session.declare_subscriber(&sub_file_keyexpr).await.unwrap();
+
+    let sub_digest = session
+        .declare_subscriber(&sub_digest_keyexpr)
         .await
         .unwrap();
 
     println!("Press CTRL-C to quit...");
-    while let Ok(query) = queryable.recv_async().await {
-        match query.payload() {
-            None => println!(">> [Queryable ] Received Query '{}'", query.selector()),
-            Some(query_payload) => {
-                // Refer to z_bytes.rs to see how to deserialize different types of message
-                let deserialized_payload = query_payload
-                    .deserialize::<String>()
-                    .unwrap_or_else(|e| format!("{}", e));
+    loop {
+        select! {
+            Ok(file_sample) = sub_file.recv_async() => {
+                println!(">> [FILE] Received sample");
+                if file_sample.payload().len() > 0 {
+                    let file = file_sample.payload().deserialize::<Vec<u8>>().unwrap();
+
+                    // compute hash
+                    let mut hasher = Keccak256::new();
+                    hasher.update(&file);
+                    let mut hash: Vec<u8> = Vec::new();
+                    hex::encode_to_slice(hasher.finalize(), &mut hash).unwrap();
+                    let hash_string = String::from_utf8(hash).unwrap();
+
+                    // store in kvs
+                    local_store.insert(hash_string.to_string(), file);
+                    println!(">> [FILE] Stored file {}", hash_string.get(0..5).unwrap());
+
+                    // compute digest
+                    let signature = "PLACEHOLDER_SIGNATURE";
+
+                    // send digest
+                    // TODO: proper serialization
+                    let message = std::format!("{hash_string}|{signature}");
+                    session.put(&sub_digest_keyexpr, message).await.unwrap();
+                    println!(
+                        ">> [FILE] Sent digest for file {}",
+                        hash_string.get(0..5).unwrap()
+                    );
+                }
+            }
+
+            Ok(file_query) = queryable_store.recv_async() => {
+                println!(">> [STORE] Received upload request");
+                match file_query.payload() {
+                    None => {
+                        // handle error
+                        file_query
+                            .reply_err("File payload should not be empty")
+                            .await
+                            .unwrap();
+                    }
+                    Some(file_payload) => {
+                        session.put(&sub_file_keyexpr, file_payload).await.unwrap();
+                    }
+                }
+                let response = "OK".to_string();
                 println!(
-                    ">> [Queryable ] Received Query '{}' with payload '{}'",
-                    query.selector(),
-                    deserialized_payload
-                )
+                    ">> [STORE] Responding ('{}': '{}')",
+                    queryable_store_keyexpr.as_str(),
+                    response,
+                );
+                file_query
+                    .reply(queryable_store_keyexpr.clone(), response)
+                    .await
+                    .unwrap_or_else(|e| println!(">> [Queryable ] Error sending reply: {e}"));
+            }
+
+            Ok(digest_sample) = sub_digest.recv_async() => {
+                println!(">> [DIGEST] Received sample");
+                if digest_sample.payload().len() > 0 {
+                    // TODO: proper deserialization
+                    let digest = digest_sample.payload().deserialize::<String>().unwrap();
+                    let deserialized: Vec<&str> = digest.split("|").collect();
+                    if deserialized.len() != 2 {
+                        println!(">> [DIGEST] Skipping invalid message");
+                    }
+
+                    let (hash, signature) = (deserialized[0], deserialized[1]);
+                    println!(
+                        ">> [DIGEST] Received digest for file {}",
+                        hash.get(0..5).unwrap()
+                    );
+
+                    if digest_store
+                        .entry(hash.to_string())
+                        .or_insert(HashSet::new())
+                        .insert(signature.to_string())
+                    {
+                        println!(
+                            ">> [DIGEST] New digest added for file {}",
+                            hash.get(0..5).unwrap()
+                        );
+                    } else {
+                        println!(
+                            ">> [DIGEST] Skipping redundant digest for file {}",
+                            hash.get(0..5).unwrap()
+                        );
+                    }
+                    // TODO: check if quorum reached (use liveliness token to count number of replicas in the network in real time)
+                }
             }
         }
-        println!(
-            ">> [Queryable ] Responding ('{}': '{}')",
-            key_expr.as_str(),
-            payload,
-        );
-        // Refer to z_bytes.rs to see how to serialize different types of message
-        query
-            .reply(key_expr.clone(), payload.clone())
-            .await
-            .unwrap_or_else(|e| println!(">> [Queryable ] Error sending reply: {e}"));
     }
 }
 
