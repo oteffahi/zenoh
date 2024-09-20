@@ -37,6 +37,7 @@ futures = { workspace = true }
 prost = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+sha3 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "io-std"] }
 unwrap-infallible = { workspace = true }
 zenoh = { workspace = true, default-features = true }
