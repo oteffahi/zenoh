@@ -5732,6 +5732,7 @@ dependencies = [
  "rustls-webpki",
  "secrecy",
  "socket2 0.5.7",
+ "time 0.3.36",
  "tokio",
  "tokio-rustls",
  "tokio-util",
