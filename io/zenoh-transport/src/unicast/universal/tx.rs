@@ -103,8 +103,7 @@ impl TransportUnicastUniversal {
 
         let pipeline = transport_link.pipeline.clone();
         tracing::trace!(
-            "Scheduled {:?} for transmission to {} ({})",
-            msg,
+            "Scheduled message for transmission to {} ({})",
             transport_link.link.link.get_dst(),
             self.get_zid()
         );
