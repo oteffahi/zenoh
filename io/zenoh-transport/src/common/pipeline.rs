@@ -797,6 +797,7 @@ impl TransmissionPipelineProducer {
         let (wait_time, max_wait_time) = if msg.is_droppable() {
             // Checked if we are blocked on the priority queue and we drop directly the message
             if self.status.is_congested(priority) {
+                tracing::debug!("is_congested: true");
                 return Ok(false);
             }
             (self.wait_before_drop.0, Some(self.wait_before_drop.1))
