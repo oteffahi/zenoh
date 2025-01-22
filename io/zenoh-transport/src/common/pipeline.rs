@@ -282,7 +282,7 @@ impl StageIn {
                                     // Still no available batch.
                                     // Restore the sequence number and drop the message
                                     $($restore_sn)?
-                                    tracing::trace!(
+                                    tracing::warn!(
                                         "Zenoh message dropped because it's over the deadline {:?}: {:?}",
                                         deadline.lazy_deadline.wait_time, msg
                                     );
