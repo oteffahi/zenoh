@@ -899,6 +899,11 @@ impl TransmissionPipelineConsumer {
     }
 
     pub(crate) fn refill(&mut self, batch: WBatch, priority: Priority) {
+        tracing::debug!(
+            "{}, {}",
+            batch.is_ephemeral(),
+            self.status.is_congested(priority)
+        );
         if !batch.is_ephemeral() {
             self.stage_out[priority as usize].refill(batch);
             self.status.set_congested(priority, false);
