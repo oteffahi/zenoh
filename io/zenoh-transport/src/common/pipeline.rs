@@ -797,7 +797,7 @@ impl TransmissionPipelineProducer {
         let (wait_time, max_wait_time) = if msg.is_droppable() {
             // Checked if we are blocked on the priority queue and we drop directly the message
             if self.status.is_congested(priority) {
-                tracing::debug!("is_congested: true");
+                tracing::debug!("early exit because is_congested is true");
                 return Ok(false);
             }
             (self.wait_before_drop.0, Some(self.wait_before_drop.1))
@@ -809,6 +809,7 @@ impl TransmissionPipelineProducer {
         let mut queue = zlock!(self.stage_in[idx]);
         let sent = queue.push_network_message(&mut msg, priority, &mut deadline)?;
         if !sent {
+            tracing::debug!("setting is_congested to true");
             self.status.set_congested(priority, true);
         }
         Ok(sent)
