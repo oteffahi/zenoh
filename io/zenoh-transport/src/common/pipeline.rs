@@ -287,6 +287,7 @@ impl StageIn {
                                         "Zenoh message dropped because it's over the deadline {:?}: {:?}",
                                         deadline.lazy_deadline.wait_time, msg
                                     );
+                                    tracing::debug!("deadline reached, is_congested:{}", self.congested);
                                     self.congested = true;
                                     return Ok(false);
                                 }
@@ -858,6 +859,7 @@ impl TransmissionPipelineConsumer {
     }
 
     pub(crate) fn refill(&mut self, batch: WBatch, priority: Priority) {
+        tracing::debug!("refill with is_ephemeral={}", &batch.is_ephemeral());
         if !batch.is_ephemeral() {
             self.stage_out[priority as usize].refill(batch);
         }

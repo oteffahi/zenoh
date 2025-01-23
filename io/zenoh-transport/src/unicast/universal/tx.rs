@@ -13,7 +13,7 @@
 //
 use zenoh_protocol::{
     core::{Priority, PriorityRange, Reliability},
-    network::NetworkMessage,
+    network::{NetworkBody, NetworkMessage},
     transport::close,
 };
 use zenoh_result::ZResult;
@@ -113,6 +113,7 @@ impl TransportUnicastUniversal {
         // block for fairly long time
         drop(transport_links);
         let droppable = msg.is_droppable();
+        let is_push = matches!(msg.body, NetworkBody::Push(_));
         let push = pipeline.push_network_message(msg)?;
         if !push && !droppable {
             tracing::error!(
@@ -131,6 +132,9 @@ impl TransportUnicastUniversal {
                     }
                 }
             });
+        }
+        if !push {
+            tracing::debug!("silently dropping message, is_push:{}", is_push);
         }
         Ok(push)
     }
