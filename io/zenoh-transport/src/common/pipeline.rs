@@ -274,6 +274,7 @@ impl StageIn {
                                     LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
                                     Ordering::Relaxed,
                                 );
+                                self.congested = false;
                                 break batch;
                             }
                             None => {
@@ -310,7 +311,6 @@ impl StageIn {
                     drop(c_guard);
                     self.s_out.notify(bytes);
                 }
-                self.congested = false;
                 return Ok(true);
             }};
         }
@@ -400,7 +400,6 @@ impl StageIn {
                     fragment.ext_first = None;
                     // Move the serialization batch into the OUT pipeline
                     self.s_out.move_batch(batch);
-                    self.congested = false;
                 }
                 Err(_) => {
                     // Restore the sequence number
@@ -421,7 +420,6 @@ impl StageIn {
 
         // Clean the fragbuf
         self.fragbuf.clear();
-        // no need to set self.congested to false, was already set on last fragment
         Ok(true)
     }
 
@@ -442,6 +440,7 @@ impl StageIn {
                                     LOCAL_EPOCH.elapsed().as_micros() as MicroSeconds,
                                     Ordering::Relaxed,
                                 );
+                                self.congested = false;
                                 break batch;
                             }
                             None => {
@@ -468,7 +467,6 @@ impl StageIn {
                     drop(c_guard);
                     self.s_out.notify(bytes);
                 }
-                self.congested = false;
                 return true;
             }};
         }
