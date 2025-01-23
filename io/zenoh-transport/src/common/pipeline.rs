@@ -400,6 +400,7 @@ impl StageIn {
                     fragment.ext_first = None;
                     // Move the serialization batch into the OUT pipeline
                     self.s_out.move_batch(batch);
+                    self.congested = false;
                 }
                 Err(_) => {
                     // Restore the sequence number
@@ -420,7 +421,7 @@ impl StageIn {
 
         // Clean the fragbuf
         self.fragbuf.clear();
-        self.congested = false;
+        // no need to set self.congested to false, was already set on last fragment
         Ok(true)
     }
 
