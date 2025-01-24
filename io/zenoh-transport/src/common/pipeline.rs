@@ -282,7 +282,7 @@ impl StageIn {
                                     // Still no available batch.
                                     // Restore the sequence number and drop the message
                                     $($restore_sn)?
-                                    tracing::trace!(
+                                    tracing::debug!(
                                         "Zenoh message dropped because it's over the deadline {:?}: {:?}",
                                         deadline.lazy_deadline.wait_time, msg
                                     );
@@ -797,6 +797,7 @@ impl TransmissionPipelineProducer {
         let (wait_time, max_wait_time) = if msg.is_droppable() {
             // Checked if we are blocked on the priority queue and we drop directly the message
             if self.status.is_congested(priority) {
+                tracing::debug!("Taking shortcut because we're congested");
                 return Ok(false);
             }
             (self.wait_before_drop.0, Some(self.wait_before_drop.1))
@@ -823,6 +824,7 @@ impl TransmissionPipelineProducer {
             // so there it is not possible that further messages see the congestion flag
             // set after this point.
             if sent {
+                tracing::debug!("Solution worked");
                 self.status.set_congested(priority, false);
             }
             // There is one edge case that is fortunately supported: if the message that
@@ -831,6 +833,9 @@ impl TransmissionPipelineProducer {
             // congested flag in that case. However, if some batches were available,
             // that means that they would have still been pushed, so we can expect them to
             // be refilled, and they will eventually unset the congested flag.
+        }
+        if !sent {
+            tracing::debug!("Silently dropping message");
         }
         Ok(sent)
     }
@@ -919,6 +924,13 @@ impl TransmissionPipelineConsumer {
     }
 
     pub(crate) fn refill(&mut self, batch: WBatch, priority: Priority) {
+        if self.status.is_congested(priority) || batch.is_ephemeral() {
+            tracing::debug!(
+                "refilled: {}, {}",
+                batch.is_ephemeral(),
+                self.status.is_congested(priority)
+            );
+        }
         if !batch.is_ephemeral() {
             self.stage_out[priority as usize].refill(batch);
             self.status.set_congested(priority, false);
