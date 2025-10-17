@@ -28,7 +28,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use zenoh_core::zasynclock;
 use zenoh_link_commons::{
-    get_ip_interface_names, parse_dscp,
+    get_ip_interface_names,
+    noprotection::{NoProtectionClientConfig, NoProtectionServerConfig},
+    parse_dscp,
     quic::{
         get_cert_chain_expiration, get_cert_common_name, get_quic_addr, get_quic_host,
         TlsClientConfig, TlsServerConfig, ALPN_QUIC_HTTP,
@@ -307,7 +309,9 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastQuic {
             .client_config
             .try_into()
             .map_err(|e| zerror!("Can not get QUIC config {host}: {e}"))?;
-        quic_endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_config)));
+        quic_endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            NoProtectionClientConfig::new(quic_config.into()),
+        )));
 
         let src_addr = quic_endpoint
             .local_addr()
@@ -393,7 +397,9 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastQuic {
             .server_config
             .try_into()
             .map_err(|e| zerror!("Can not create a new QUIC listener on {addr}: {e}"))?;
-        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            NoProtectionServerConfig::new(quic_config.into()),
+        ));
 
         // We do not accept unidireactional streams.
         Arc::get_mut(&mut server_config.transport)

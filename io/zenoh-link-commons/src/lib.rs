@@ -23,6 +23,8 @@ mod dscp;
 mod listener;
 mod multicast;
 #[cfg(feature = "quic")]
+pub mod noprotection;
+#[cfg(feature = "quic")]
 pub mod quic;
 pub mod tcp;
 #[cfg(feature = "tls")]

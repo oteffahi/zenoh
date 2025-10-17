@@ -20,7 +20,9 @@ use std::{
     sync::Arc,
 };
 
+use quinn::crypto::rustls::QuicClientConfig;
 use rustls::{
+    crypto::CryptoProvider,
     pki_types::{CertificateDer, PrivateKeyDer, TrustAnchor},
     server::WebPkiClientVerifier,
     version::TLS13,
@@ -38,6 +40,7 @@ use zenoh_protocol::core::{
 use zenoh_result::{bail, zerror, ZError, ZResult};
 
 use crate::{
+    noprotection::NoProtectionClientConfig,
     tls::{config::*, WebPkiVerifierAnyServerName},
     ConfigurationInspector, LinkAuthId, BIND_INTERFACE,
 };
@@ -179,37 +182,47 @@ impl<'a> TlsServerConfig<'a> {
                 .map_err(|_| zerror!("Unknown close on expiration argument: {}", s))?,
             None => TLS_CLOSE_LINK_ON_EXPIRATION_DEFAULT,
         };
-        let tls_server_private_key = TlsServerConfig::load_tls_private_key(config).await?;
-        let tls_server_certificate = TlsServerConfig::load_tls_certificate(config).await?;
+        // let tls_server_private_key = TlsServerConfig::load_tls_private_key(config).await?;
+        // let tls_server_certificate = TlsServerConfig::load_tls_certificate(config).await?;
 
-        let certs: Vec<CertificateDer> =
-            rustls_pemfile::certs(&mut Cursor::new(&tls_server_certificate))
-                .collect::<Result<_, _>>()
-                .map_err(|err| zerror!("Error processing server certificate: {err}."))?;
+        // let certs: Vec<CertificateDer> =
+        //     rustls_pemfile::certs(&mut Cursor::new(&tls_server_certificate))
+        //         .collect::<Result<_, _>>()
+        //         .map_err(|err| zerror!("Error processing server certificate: {err}."))?;
 
-        let mut keys: Vec<PrivateKeyDer> =
-            rustls_pemfile::rsa_private_keys(&mut Cursor::new(&tls_server_private_key))
-                .map(|x| x.map(PrivateKeyDer::from))
-                .collect::<Result<_, _>>()
-                .map_err(|err| zerror!("Error processing server key: {err}."))?;
+        // let mut keys: Vec<PrivateKeyDer> =
+        //     rustls_pemfile::rsa_private_keys(&mut Cursor::new(&tls_server_private_key))
+        //         .map(|x| x.map(PrivateKeyDer::from))
+        //         .collect::<Result<_, _>>()
+        //         .map_err(|err| zerror!("Error processing server key: {err}."))?;
 
-        if keys.is_empty() {
-            keys = rustls_pemfile::pkcs8_private_keys(&mut Cursor::new(&tls_server_private_key))
-                .map(|x| x.map(PrivateKeyDer::from))
-                .collect::<Result<_, _>>()
-                .map_err(|err| zerror!("Error processing server key: {err}."))?;
-        }
+        // if keys.is_empty() {
+        //     keys = rustls_pemfile::pkcs8_private_keys(&mut Cursor::new(&tls_server_private_key))
+        //         .map(|x| x.map(PrivateKeyDer::from))
+        //         .collect::<Result<_, _>>()
+        //         .map_err(|err| zerror!("Error processing server key: {err}."))?;
+        // }
 
-        if keys.is_empty() {
-            keys = rustls_pemfile::ec_private_keys(&mut Cursor::new(&tls_server_private_key))
-                .map(|x| x.map(PrivateKeyDer::from))
-                .collect::<Result<_, _>>()
-                .map_err(|err| zerror!("Error processing server key: {err}."))?;
-        }
+        // if keys.is_empty() {
+        //     keys = rustls_pemfile::ec_private_keys(&mut Cursor::new(&tls_server_private_key))
+        //         .map(|x| x.map(PrivateKeyDer::from))
+        //         .collect::<Result<_, _>>()
+        //         .map_err(|err| zerror!("Error processing server key: {err}."))?;
+        // }
 
-        if keys.is_empty() {
-            bail!("No private key found for TLS server.");
-        }
+        // if keys.is_empty() {
+        //     bail!("No private key found for TLS server.");
+        // }
+
+        let (mut keys, certs) = {
+            let cert = rcgen::generate_simple_self_signed(vec![]).unwrap();
+            (
+                vec![Into::<rustls::pki_types::PrivateKeyDer>::into(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
+                )],
+                vec![CertificateDer::from(cert.cert)],
+            )
+        };
 
         // Install ring based rustls CryptoProvider.
         rustls::crypto::ring::default_provider()
@@ -318,7 +331,7 @@ impl<'a> TlsClientConfig<'a> {
             // when there are multiple quic links, and all but the first execution will fail.
             .ok();
 
-        let cc = if tls_client_server_auth {
+        let cc = if false {
             tracing::debug!("Loading client authentication key and certificate...");
             let tls_client_private_key = TlsClientConfig::load_tls_private_key(config).await?;
             let tls_client_certificate = TlsClientConfig::load_tls_certificate(config).await?;
@@ -369,19 +382,16 @@ impl<'a> TlsClientConfig<'a> {
             }
             .map_err(|e| zerror!("Bad certificate/key: {}", e))?
         } else {
-            let builder = ClientConfig::builder();
-            if tls_server_name_verification {
-                builder
-                    .with_root_certificates(root_cert_store)
-                    .with_no_client_auth()
-            } else {
-                builder
-                    .dangerous()
-                    .with_custom_certificate_verifier(Arc::new(WebPkiVerifierAnyServerName::new(
-                        root_cert_store,
-                    )))
-                    .with_no_client_auth()
-            }
+            let provider = CryptoProvider::get_default()
+                .expect("default cypto provider should be set")
+                .clone();
+            ClientConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&TLS13])?
+                .dangerous()
+                .with_custom_certificate_verifier(
+                    crate::tls::unsecure::SkipServerVerification::new(provider),
+                )
+                .with_no_client_auth()
         };
         Ok(TlsClientConfig {
             client_config: cc,
