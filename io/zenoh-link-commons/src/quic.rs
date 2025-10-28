@@ -40,7 +40,6 @@ use zenoh_protocol::core::{
 use zenoh_result::{bail, zerror, ZError, ZResult};
 
 use crate::{
-    noprotection::NoProtectionClientConfig,
     tls::{config::*, WebPkiVerifierAnyServerName},
     ConfigurationInspector, LinkAuthId, BIND_INTERFACE,
 };

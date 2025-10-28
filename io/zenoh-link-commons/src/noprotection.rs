@@ -10,98 +10,114 @@ use quinn_proto::{
     transport_parameters, ConnectionId, Side, TransportError,
 };
 
-/// A rustls TLS session which does not perform packet encryption/decryption (for debugging purpose)
-struct NoProtectionSession {
-    inner: Box<dyn crypto::Session>,
-}
+struct PlainTextSession(Box<dyn crypto::Session>);
 
-impl NoProtectionSession {
-    fn new(tls: Box<dyn crypto::Session>) -> Self {
-        Self { inner: tls }
-    }
-
-    /// Wraps the provided keys in `NoProtectionPacketKey` to disable packet encryption / decryption
+impl PlainTextSession {
     fn wrap_packet_keys(
         keys: crypto::KeyPair<Box<dyn crypto::PacketKey>>,
     ) -> crypto::KeyPair<Box<dyn crypto::PacketKey>> {
         crypto::KeyPair {
-            local: Box::new(NoProtectionPacketKey::new(keys.local)),
-            remote: Box::new(NoProtectionPacketKey::new(keys.remote)),
+            local: Box::new(NoProtectionPacketKey(keys.local)),
+            remote: Box::new(NoProtectionPacketKey(keys.remote)),
         }
     }
 }
 
-struct NoProtectionPacketKey {
-    inner: Box<dyn crypto::PacketKey>,
-}
+struct NoProtectionPacketKey(Box<dyn crypto::PacketKey>);
 
-impl NoProtectionPacketKey {
-    fn new(key: Box<dyn crypto::PacketKey>) -> Self {
-        Self { inner: key }
+impl crypto::PacketKey for NoProtectionPacketKey {
+    fn encrypt(&self, _packet: u64, buf: &mut [u8], header_len: usize) {
+        let (_header, payload_tag) = buf.split_at_mut(header_len);
+        let (_payload, tag) = payload_tag.split_at_mut(payload_tag.len() - self.0.tag_len());
+        // There is no AEAD encryption, therefore fill authentication tag with '*'
+        tag.fill(42);
+    }
+
+    fn decrypt(
+        &self,
+        _packet: u64,
+        _header: &[u8],
+        payload: &mut BytesMut,
+    ) -> Result<(), CryptoError> {
+        let plain_len = payload.len() - self.0.tag_len();
+        payload.truncate(plain_len);
+        Ok(())
+    }
+
+    fn tag_len(&self) -> usize {
+        self.0.tag_len()
+    }
+
+    fn confidentiality_limit(&self) -> u64 {
+        self.0.confidentiality_limit()
+    }
+
+    fn integrity_limit(&self) -> u64 {
+        self.0.integrity_limit()
     }
 }
 
-pub struct NoProtectionClientConfig {
+pub struct PlainTextClientConfig {
     inner: Arc<QuicClientConfig>,
 }
 
-impl NoProtectionClientConfig {
+impl PlainTextClientConfig {
     pub fn new(config: Arc<QuicClientConfig>) -> Self {
         Self { inner: config }
     }
 }
 
-pub struct NoProtectionServerConfig {
+pub struct PlainTextServerConfig {
     inner: Arc<QuicServerConfig>,
 }
 
-impl NoProtectionServerConfig {
+impl PlainTextServerConfig {
     pub fn new(config: Arc<QuicServerConfig>) -> Self {
         Self { inner: config }
     }
 }
 
 // forward all calls to inner except those related to packet encryption/decryption
-impl crypto::Session for NoProtectionSession {
+impl crypto::Session for PlainTextSession {
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> crypto::Keys {
-        self.inner.initial_keys(dst_cid, side)
+        self.0.initial_keys(dst_cid, side)
     }
 
     fn handshake_data(&self) -> Option<Box<dyn std::any::Any>> {
-        self.inner.handshake_data()
+        self.0.handshake_data()
     }
 
     fn peer_identity(&self) -> Option<Box<dyn std::any::Any>> {
-        self.inner.peer_identity()
+        self.0.peer_identity()
     }
 
     fn early_crypto(&self) -> Option<(Box<dyn crypto::HeaderKey>, Box<dyn crypto::PacketKey>)> {
-        let (hkey, pkey) = self.inner.early_crypto()?;
+        let (hkey, pkey) = self.0.early_crypto()?;
 
         // use wrapper type to disable packet encryption/decryption
-        Some((hkey, Box::new(NoProtectionPacketKey::new(pkey))))
+        Some((hkey, Box::new(NoProtectionPacketKey(pkey))))
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
-        self.inner.early_data_accepted()
+        self.0.early_data_accepted()
     }
 
     fn is_handshaking(&self) -> bool {
-        self.inner.is_handshaking()
+        self.0.is_handshaking()
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
-        self.inner.read_handshake(buf)
+        self.0.read_handshake(buf)
     }
 
     fn transport_parameters(
         &self,
     ) -> Result<Option<transport_parameters::TransportParameters>, TransportError> {
-        self.inner.transport_parameters()
+        self.0.transport_parameters()
     }
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<crypto::Keys> {
-        let keys = self.inner.write_handshake(buf)?;
+        let keys = self.0.write_handshake(buf)?;
 
         Some(crypto::Keys {
             header: keys.header,
@@ -110,12 +126,12 @@ impl crypto::Session for NoProtectionSession {
     }
 
     fn next_1rtt_keys(&mut self) -> Option<crypto::KeyPair<Box<dyn crypto::PacketKey>>> {
-        let keys = self.inner.next_1rtt_keys()?;
+        let keys = self.0.next_1rtt_keys()?;
         Some(Self::wrap_packet_keys(keys))
     }
 
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
-        self.inner.is_valid_retry(orig_dst_cid, header, payload)
+        self.0.is_valid_retry(orig_dst_cid, header, payload)
     }
 
     fn export_keying_material(
@@ -124,11 +140,11 @@ impl crypto::Session for NoProtectionSession {
         label: &[u8],
         context: &[u8],
     ) -> Result<(), crypto::ExportKeyingMaterialError> {
-        self.inner.export_keying_material(output, label, context)
+        self.0.export_keying_material(output, label, context)
     }
 }
 
-impl crypto::ClientConfig for NoProtectionClientConfig {
+impl crypto::ClientConfig for PlainTextClientConfig {
     fn start_session(
         self: std::sync::Arc<Self>,
         version: u32,
@@ -140,11 +156,11 @@ impl crypto::ClientConfig for NoProtectionClientConfig {
             .clone()
             .start_session(version, server_name, params)?;
 
-        Ok(Box::new(NoProtectionSession::new(tls)))
+        Ok(Box::new(PlainTextSession(tls)))
     }
 }
 
-impl crypto::ServerConfig for NoProtectionServerConfig {
+impl crypto::ServerConfig for PlainTextServerConfig {
     fn initial_keys(
         &self,
         version: u32,
@@ -162,42 +178,8 @@ impl crypto::ServerConfig for NoProtectionServerConfig {
         version: u32,
         params: &transport_parameters::TransportParameters,
     ) -> Box<dyn crypto::Session> {
-        let tls = self.inner.clone().start_session(version, params);
-
-        Box::new(NoProtectionSession::new(tls))
-    }
-}
-
-// forward all calls to inner except those related to packet encryption/decryption
-impl crypto::PacketKey for NoProtectionPacketKey {
-    fn encrypt(&self, _packet: u64, buf: &mut [u8], header_len: usize) {
-        let (_header, payload_tag) = buf.split_at_mut(header_len);
-        let (_payload, tag_storage) =
-            payload_tag.split_at_mut(payload_tag.len() - self.inner.tag_len());
-        // packet = identity(packet)
-        tag_storage.fill(42);
-    }
-
-    fn decrypt(
-        &self,
-        _packet: u64,
-        _header: &[u8],
-        payload: &mut BytesMut,
-    ) -> Result<(), CryptoError> {
-        let plain_len = payload.len() - self.inner.tag_len();
-        payload.truncate(plain_len);
-        Ok(())
-    }
-
-    fn tag_len(&self) -> usize {
-        self.inner.tag_len()
-    }
-
-    fn confidentiality_limit(&self) -> u64 {
-        self.inner.confidentiality_limit()
-    }
-
-    fn integrity_limit(&self) -> u64 {
-        self.inner.integrity_limit()
+        Box::new(PlainTextSession(
+            self.inner.clone().start_session(version, params),
+        ))
     }
 }
