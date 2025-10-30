@@ -17,15 +17,35 @@ impl PlainTextSession {
         keys: crypto::KeyPair<Box<dyn crypto::PacketKey>>,
     ) -> crypto::KeyPair<Box<dyn crypto::PacketKey>> {
         crypto::KeyPair {
-            local: Box::new(NoProtectionPacketKey(keys.local)),
-            remote: Box::new(NoProtectionPacketKey(keys.remote)),
+            local: Box::new(NoOpEncryptionKeys(keys.local)),
+            remote: Box::new(NoOpEncryptionKeys(keys.remote)),
+        }
+    }
+
+    fn wrap_header_keys(
+        keys: crypto::KeyPair<Box<dyn crypto::HeaderKey>>,
+    ) -> crypto::KeyPair<Box<dyn crypto::HeaderKey>> {
+        crypto::KeyPair {
+            local: Box::new(NoOpEncryptionKeys(keys.local)),
+            remote: Box::new(NoOpEncryptionKeys(keys.remote)),
         }
     }
 }
 
-struct NoProtectionPacketKey(Box<dyn crypto::PacketKey>);
+/// No-op wrapper for encryption keys.
+/// Disables encryption and decryption of payloads
+struct NoOpEncryptionKeys<T>(T);
 
-impl crypto::PacketKey for NoProtectionPacketKey {
+// impl<T> NoOpEncryptionKeys<T> {
+//     fn wrap_keypair(keys: crypto::KeyPair<T>) -> crypto::KeyPair<T> {
+//         crypto::KeyPair {
+//             local: Box::new(NoOpEncryptionKeys(keys.local)),
+//             remote: Box::new(NoOpEncryptionKeys(keys.remote)),
+//         }
+//     }
+// }
+
+impl crypto::PacketKey for NoOpEncryptionKeys<Box<dyn crypto::PacketKey>> {
     fn encrypt(&self, _packet: u64, buf: &mut [u8], header_len: usize) {
         let (_header, payload_tag) = buf.split_at_mut(header_len);
         let (_payload, tag) = payload_tag.split_at_mut(payload_tag.len() - self.0.tag_len());
@@ -57,6 +77,18 @@ impl crypto::PacketKey for NoProtectionPacketKey {
     }
 }
 
+impl crypto::HeaderKey for NoOpEncryptionKeys<Box<dyn crypto::HeaderKey>> {
+    // No ECB decryption
+    fn decrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
+
+    // No ECB encryption
+    fn encrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
+
+    fn sample_size(&self) -> usize {
+        self.0.sample_size()
+    }
+}
+
 pub struct PlainTextClientConfig {
     inner: Arc<QuicClientConfig>,
 }
@@ -77,10 +109,12 @@ impl PlainTextServerConfig {
     }
 }
 
-// forward all calls to inner except those related to packet encryption/decryption
 impl crypto::Session for PlainTextSession {
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> crypto::Keys {
-        self.0.initial_keys(dst_cid, side)
+        let mut keys = self.0.initial_keys(dst_cid, side);
+        keys.header = Self::wrap_header_keys(keys.header);
+        keys.packet = Self::wrap_packet_keys(keys.packet);
+        keys
     }
 
     fn handshake_data(&self) -> Option<Box<dyn std::any::Any>> {
@@ -93,9 +127,10 @@ impl crypto::Session for PlainTextSession {
 
     fn early_crypto(&self) -> Option<(Box<dyn crypto::HeaderKey>, Box<dyn crypto::PacketKey>)> {
         let (hkey, pkey) = self.0.early_crypto()?;
-
-        // use wrapper type to disable packet encryption/decryption
-        Some((hkey, Box::new(NoProtectionPacketKey(pkey))))
+        Some((
+            Box::new(NoOpEncryptionKeys(hkey)),
+            Box::new(NoOpEncryptionKeys(pkey)),
+        ))
     }
 
     fn early_data_accepted(&self) -> Option<bool> {
@@ -118,9 +153,8 @@ impl crypto::Session for PlainTextSession {
 
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<crypto::Keys> {
         let keys = self.0.write_handshake(buf)?;
-
         Some(crypto::Keys {
-            header: keys.header,
+            header: Self::wrap_header_keys(keys.header),
             packet: Self::wrap_packet_keys(keys.packet),
         })
     }
@@ -166,7 +200,10 @@ impl crypto::ServerConfig for PlainTextServerConfig {
         version: u32,
         dst_cid: &ConnectionId,
     ) -> Result<crypto::Keys, crypto::UnsupportedVersion> {
-        self.inner.initial_keys(version, dst_cid)
+        let mut keys = self.inner.initial_keys(version, dst_cid)?;
+        keys.header = PlainTextSession::wrap_header_keys(keys.header);
+        keys.packet = PlainTextSession::wrap_packet_keys(keys.packet);
+        Ok(keys)
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
