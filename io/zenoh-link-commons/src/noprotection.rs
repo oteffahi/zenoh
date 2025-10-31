@@ -46,26 +46,20 @@ struct NoOpEncryptionKeys<T>(T);
 // }
 
 impl crypto::PacketKey for NoOpEncryptionKeys<Box<dyn crypto::PacketKey>> {
-    fn encrypt(&self, _packet: u64, buf: &mut [u8], header_len: usize) {
-        let (_header, payload_tag) = buf.split_at_mut(header_len);
-        let (_payload, tag) = payload_tag.split_at_mut(payload_tag.len() - self.0.tag_len());
-        // There is no AEAD encryption, therefore fill authentication tag with '*'
-        tag.fill(42);
-    }
+    fn encrypt(&self, _packet: u64, _buf: &mut [u8], _header_len: usize) {}
 
     fn decrypt(
         &self,
         _packet: u64,
         _header: &[u8],
-        payload: &mut BytesMut,
+        _payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        let plain_len = payload.len() - self.0.tag_len();
-        payload.truncate(plain_len);
         Ok(())
     }
 
     fn tag_len(&self) -> usize {
-        self.0.tag_len()
+        // NO AEAD tag
+        0
     }
 
     fn confidentiality_limit(&self) -> u64 {
@@ -85,7 +79,8 @@ impl crypto::HeaderKey for NoOpEncryptionKeys<Box<dyn crypto::HeaderKey>> {
     fn encrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {}
 
     fn sample_size(&self) -> usize {
-        self.0.sample_size()
+        // No header encryption: set sample_size to 0 to avoid unnecessary padding of payloads
+        0
     }
 }
 
