@@ -22,7 +22,7 @@ use std::{
 use async_trait::async_trait;
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
-    EndpointConfig,
+    EndpointConfig, TransportConfig,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -309,9 +309,15 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastQuic {
             .client_config
             .try_into()
             .map_err(|e| zerror!("Can not get QUIC config {host}: {e}"))?;
-        quic_endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-            PlainTextClientConfig::new(quic_config.into()),
-        )));
+        quic_endpoint.set_default_client_config({
+            let mut client_config =
+                quinn::ClientConfig::new(Arc::new(PlainTextClientConfig::new(quic_config.into())));
+            // Disable MTU discovery
+            let mut transport_config = TransportConfig::default();
+            transport_config.mtu_discovery_config(None);
+            client_config.transport_config(transport_config.into());
+            client_config
+        });
 
         let src_addr = quic_endpoint
             .local_addr()
@@ -409,6 +415,10 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastQuic {
         Arc::get_mut(&mut server_config.transport)
             .unwrap()
             .max_concurrent_bidi_streams(1_u8.into());
+        // Disable MTU discovery
+        Arc::get_mut(&mut server_config.transport)
+            .unwrap()
+            .mtu_discovery_config(None);
 
         // Initialize the Endpoint
         let quic_endpoint = if let Some(iface) = server_crypto.bind_iface {
