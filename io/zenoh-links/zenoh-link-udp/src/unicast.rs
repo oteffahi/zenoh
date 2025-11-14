@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use zenoh_core::{zasynclock, zlock};
 use zenoh_link_commons::{
     get_ip_interface_names, parse_dscp, set_dscp, ConstructibleLinkManagerUnicast, LinkAuthId,
-    LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, ListenersUnicastIP,
+    LinkManagerUnicastTrait, LinkUnicast, LinkUnicastTrait, ListenersUnicastIP, LocatorInspector,
     NewLinkChannelSender, BIND_INTERFACE, BIND_SOCKET,
 };
 use zenoh_protocol::{
@@ -39,7 +39,7 @@ use super::{
     get_udp_addrs, socket_addr_to_udp_locator, UDP_ACCEPT_THROTTLE_TIME, UDP_DEFAULT_MTU,
     UDP_MAX_MTU,
 };
-use crate::pktinfo;
+use crate::{pktinfo, sctp::LinkUnicastSctp, UdpLocatorInspector};
 
 type LinkHashMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), Weak<LinkUnicastUdpUnconnected>>>>;
 type LinkInput = (Vec<u8>, usize);
@@ -129,11 +129,11 @@ enum LinkUnicastUdpVariant {
 
 pub struct LinkUnicastUdp {
     // The source socket address of this link (address used on the local host)
-    src_addr: SocketAddr,
-    src_locator: Locator,
+    pub(crate) src_addr: SocketAddr,
+    pub(crate) src_locator: Locator,
     // The destination socket address of this link (address used on the remote host)
-    dst_addr: SocketAddr,
-    dst_locator: Locator,
+    pub(crate) dst_addr: SocketAddr,
+    pub(crate) dst_locator: Locator,
     // The UDP socket is connected to the peer
     variant: LinkUnicastUdpVariant,
 }
@@ -378,6 +378,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUdp {
             .await?
             .filter(|a| !a.ip().is_multicast());
         let config = endpoint.config();
+        let is_reliable = UdpLocatorInspector.is_reliable(&endpoint.to_locator())?;
         let iface = config.get(BIND_INTERFACE);
 
         if let (Some(_), Some(_)) = (config.get(BIND_INTERFACE), config.get(BIND_SOCKET)) {
@@ -396,13 +397,19 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUdp {
             match self.new_link_inner(&da, iface, bind_socket, dscp).await {
                 Ok((socket, src_addr, dst_addr)) => {
                     // Create UDP link
-                    let link = Arc::new(LinkUnicastUdp::new(
-                        src_addr,
-                        dst_addr,
-                        LinkUnicastUdpVariant::Connected(LinkUnicastUdpConnected {
-                            socket: Arc::new(socket),
-                        }),
-                    ));
+                    let link: Arc<dyn LinkUnicastTrait> = {
+                        let link_udp = LinkUnicastUdp::new(
+                            src_addr,
+                            dst_addr,
+                            LinkUnicastUdpVariant::Connected(LinkUnicastUdpConnected {
+                                socket: Arc::new(socket),
+                            }),
+                        );
+                        match is_reliable {
+                            true => Arc::new(LinkUnicastSctp::open(link_udp).await?),
+                            false => Arc::new(link_udp),
+                        }
+                    };
 
                     return Ok(LinkUnicast(link));
                 }
@@ -428,6 +435,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUdp {
             .await?
             .filter(|a| !a.ip().is_multicast());
         let config = endpoint.config();
+        let is_reliable = UdpLocatorInspector.is_reliable(&endpoint.to_locator())?;
         let iface = config.get(BIND_INTERFACE);
         let dscp = parse_dscp(&config)?;
 
@@ -449,7 +457,7 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUdp {
                         let token = token.clone();
                         let manager = self.manager.clone();
 
-                        async move { accept_read_task(socket, token, manager).await }
+                        async move { accept_read_task(socket, token, manager, is_reliable).await }
                     };
 
                     let locator = endpoint.to_locator();
@@ -519,6 +527,7 @@ async fn accept_read_task(
     socket: UdpSocket,
     token: CancellationToken,
     manager: NewLinkChannelSender,
+    is_reliable: bool,
 ) -> ZResult<()> {
     let socket = Arc::new(socket);
     let links: LinkHashMap = Arc::new(Mutex::new(HashMap::new()));
@@ -587,14 +596,25 @@ async fn accept_read_task(
                                     });
                                     zaddlink!(src_addr, dst_addr, Arc::downgrade(&unconnected));
                                     // Create the new link object
-                                    let link = Arc::new(LinkUnicastUdp::new(
+                                    let link = LinkUnicastUdp::new(
                                         src_addr,
                                         dst_addr,
                                         LinkUnicastUdpVariant::Unconnected(unconnected),
-                                    ));
-                                    // Add the new link to the set of connected peers
-                                    if let Err(e) = manager.send_async(LinkUnicast(link)).await {
-                                        tracing::error!("{}-{}: {}", file!(), line!(), e)
+                                    );
+                                    match is_reliable {
+                                        // if set to reliable, spawn SCTP acceptor for this connection
+                                        true => LinkUnicastSctp::spawn_acceptor(
+                                            link,
+                                            manager.clone(),
+                                            token.child_token(),
+                                            tokio::runtime::Handle::current()
+                                        ),
+                                        false => {
+                                            // Add the new link to the set of connected peers
+                                            if let Err(e) = manager.send_async(LinkUnicast(Arc::new(link))).await {
+                                                tracing::error!("{}-{}: {}", file!(), line!(), e)
+                                            }
+                                        }
                                     }
                                 }
                             }
