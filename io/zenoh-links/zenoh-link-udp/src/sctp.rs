@@ -168,7 +168,7 @@ impl LinkUnicastTrait for LinkUnicastSctp {
     }
 
     async fn write(&self, buffer: &[u8]) -> ZResult<usize> {
-        // TODO: find a way to remove this allocation + copy
+        // This copy is necessary, calls to write return before finishing to write on the wire
         Ok(self.stream.write(&Bytes::copy_from_slice(buffer)).await?)
     }
 
