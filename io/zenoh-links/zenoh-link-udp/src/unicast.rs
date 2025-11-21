@@ -20,7 +20,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::{net::UdpSocket, sync::Mutex as AsyncMutex};
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex as AsyncMutex, Semaphore},
+};
 use tokio_util::sync::CancellationToken;
 use zenoh_core::{zasynclock, zlock};
 use zenoh_link_commons::{
@@ -39,7 +42,11 @@ use super::{
     get_udp_addrs, socket_addr_to_udp_locator, UDP_ACCEPT_THROTTLE_TIME, UDP_DEFAULT_MTU,
     UDP_MAX_MTU,
 };
-use crate::{pktinfo, sctp::LinkUnicastSctp, UdpLocatorInspector};
+use crate::{
+    pktinfo,
+    sctp::{LinkUnicastSctp, SCTP_MAX_CONCURRENT_ACCEPT},
+    UdpLocatorInspector,
+};
 
 type LinkHashMap = Arc<Mutex<HashMap<(SocketAddr, SocketAddr), Weak<LinkUnicastUdpUnconnected>>>>;
 type LinkInput = (Vec<u8>, usize);
@@ -571,6 +578,13 @@ async fn accept_read_task(
 
     tracing::trace!("Ready to accept UDP connections on: {:?}", local_src_addr);
 
+    let pending_connections = match is_reliable {
+        // Max number of pending connections must be handled for SCTP
+        true => Some(Semaphore::new(SCTP_MAX_CONCURRENT_ACCEPT)),
+        // Nothing to do: Zenoh transport already handles its own max number of pending connections
+        false => None,
+    };
+
     loop {
         // Buffers for deserialization
         let mut buff = zenoh_buffers::vec::uninit(UDP_MAX_MTU as usize);
@@ -607,7 +621,10 @@ async fn accept_read_task(
                                             link,
                                             manager.clone(),
                                             token.child_token(),
-                                            tokio::runtime::Handle::current()
+                                            pending_connections
+                                                .as_ref()
+                                                .expect("pending_connections should be set when listener is reliable"),
+                                            tokio::runtime::Handle::current(),
                                         ),
                                         false => {
                                             // Add the new link to the set of connected peers

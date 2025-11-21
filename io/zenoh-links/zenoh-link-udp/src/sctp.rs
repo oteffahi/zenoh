@@ -2,6 +2,7 @@ use core::fmt;
 use std::{net::SocketAddr, sync::Arc};
 
 use async_trait::async_trait;
+use tokio::sync::Semaphore;
 use tokio_util::{bytes::Bytes, sync::CancellationToken};
 use webrtc_sctp::{
     association::Association, chunk::chunk_payload_data::PayloadProtocolIdentifier, stream::Stream,
@@ -12,6 +13,11 @@ use zenoh_protocol::{core::Locator, transport::BatchSize};
 use zenoh_result::{zerror, ZResult};
 
 use crate::LinkUnicastUdp;
+
+/// Timeout for pending SCTP handshake and stream establishments
+const SCTP_ESTABLISHMENT_TIMEOUT_MS: u64 = 2000;
+/// Max number of pending SCTP connections per listener
+pub(crate) const SCTP_MAX_CONCURRENT_ACCEPT: usize = 100;
 
 // Implement Conn trait for LinkUnicastUdp so it cas serve as transport for SCTP
 type WebRtcUtilResult<T> = std::result::Result<T, webrtc_util::Error>;
@@ -74,8 +80,13 @@ impl LinkUnicastSctp {
         udp_link: LinkUnicastUdp,
         manager: NewLinkChannelSender,
         token: CancellationToken,
+        sctp_acceptors: &Semaphore,
         handle: tokio::runtime::Handle,
     ) {
+        let Ok(_permit) = sctp_acceptors.try_acquire() else {
+            tracing::error!("Could not accept SCTP-over-UDP connection: max number of pending SCTP connections reached");
+            return;
+        };
         let udp_link = Arc::new(udp_link);
         let config = webrtc_sctp::association::Config {
             net_conn: udp_link.clone(),
@@ -107,8 +118,7 @@ impl LinkUnicastSctp {
         };
         let accept_with_timeout = async {
             tokio::select! {
-                // TODO: expose timeout in link config
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => bail!("timeout!"),
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(SCTP_ESTABLISHMENT_TIMEOUT_MS)) => bail!("timeout!"),
                 res = acceptor_task => res,
             }
         };
