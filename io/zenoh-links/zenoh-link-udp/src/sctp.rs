@@ -139,22 +139,30 @@ impl LinkUnicastSctp {
             local_port: udp_link.src_addr.port(),
             remote_port: udp_link.dst_addr.port(),
         };
-        let sctp_association = Association::client(config)
-            .await
-            .map_err(|e| format!("failed to create SCTP association: {e}"))?;
+        let open_sctp = async {
+            let sctp_association = Association::client(config)
+                .await
+                .map_err(|e| format!("failed to create SCTP association: {e}"))?;
 
-        // as client, open stream to initiate Zenoh handshake
-        let stream = sctp_association
-            .open_stream(0, PayloadProtocolIdentifier::Binary)
-            .await
-            .map_err(|e| format!("failed to open SCTP stream: {e}"))?;
-        stream.set_reliability_params(false, webrtc_sctp::stream::ReliabilityType::Reliable, 0);
+            // as client, open stream to initiate Zenoh handshake
+            let stream = sctp_association
+                .open_stream(0, PayloadProtocolIdentifier::Binary)
+                .await
+                .map_err(|e| format!("failed to open SCTP stream: {e}"))?;
+            stream.set_reliability_params(false, webrtc_sctp::stream::ReliabilityType::Reliable, 0);
 
-        Ok(Self {
-            udp_link,
-            sctp_association,
-            stream,
-        })
+            ZResult::Ok(Self {
+                udp_link,
+                sctp_association,
+                stream,
+            })
+        };
+        tokio::select! {
+            // TODO: expose timeout in link config
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => bail!("timeout!"),
+            res = open_sctp => res,
+        }
+        .map_err(|e| zerror!("Could not open SCTP-over-UDP connection: {e}").into())
     }
 }
 
