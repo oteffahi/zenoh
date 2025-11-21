@@ -6,6 +6,7 @@ use tokio_util::{bytes::Bytes, sync::CancellationToken};
 use webrtc_sctp::{
     association::Association, chunk::chunk_payload_data::PayloadProtocolIdentifier, stream::Stream,
 };
+use zenoh_core::bail;
 use zenoh_link_commons::{LinkAuthId, LinkUnicast, LinkUnicastTrait, NewLinkChannelSender};
 use zenoh_protocol::{core::Locator, transport::BatchSize};
 use zenoh_result::{zerror, ZResult};
@@ -104,12 +105,17 @@ impl LinkUnicastSctp {
                 stream,
             })
         };
+        let accept_with_timeout = async {
+            tokio::select! {
+                // TODO: expose timeout in link config
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => bail!("timeout!"),
+                res = acceptor_task => res,
+            }
+        };
         handle.spawn(async move {
             tokio::select! {
                 _ = token.cancelled() => {},
-                // TODO: expose timeout in link config
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => {},
-                result = acceptor_task => {
+                result = accept_with_timeout => {
                     match result {
                         Ok(link) => if let Err(e) = manager.send_async(LinkUnicast(Arc::new(link))).await {
                             tracing::error!("{}-{}: {}", file!(), line!(), e)
