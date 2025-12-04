@@ -168,8 +168,7 @@ impl LinkUnicastSctp {
             })
         };
         tokio::select! {
-            // TODO: expose timeout in link config
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(1000)) => bail!("timeout!"),
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(SCTP_ESTABLISHMENT_TIMEOUT_MS)) => bail!("timeout!"),
             res = open_sctp => res,
         }
         .map_err(|e| zerror!("Could not open SCTP-over-UDP connection: {e}").into())
