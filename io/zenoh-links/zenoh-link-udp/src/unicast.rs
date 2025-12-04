@@ -580,7 +580,7 @@ async fn accept_read_task(
 
     let pending_connections = match is_reliable {
         // Max number of pending connections must be handled for SCTP
-        true => Some(Semaphore::new(SCTP_MAX_CONCURRENT_ACCEPT)),
+        true => Some(Arc::new(Semaphore::new(SCTP_MAX_CONCURRENT_ACCEPT))),
         // Nothing to do: Zenoh transport already handles its own max number of pending connections
         false => None,
     };
@@ -623,7 +623,8 @@ async fn accept_read_task(
                                             token.child_token(),
                                             pending_connections
                                                 .as_ref()
-                                                .expect("pending_connections should be set when listener is reliable"),
+                                                .expect("pending_connections should be set when listener is reliable")
+                                                .clone(),
                                             tokio::runtime::Handle::current(),
                                         ),
                                         false => {
@@ -662,5 +663,8 @@ async fn accept_read_task(
         }
     }
 
+    if let Some(sem) = pending_connections.as_ref() {
+        sem.close();
+    }
     Ok(())
 }

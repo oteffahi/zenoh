@@ -80,25 +80,23 @@ impl LinkUnicastSctp {
         udp_link: LinkUnicastUdp,
         manager: NewLinkChannelSender,
         token: CancellationToken,
-        sctp_acceptors: &Semaphore,
+        sctp_acceptors: Arc<Semaphore>,
         handle: tokio::runtime::Handle,
     ) {
-        let Ok(_permit) = sctp_acceptors.try_acquire() else {
-            tracing::error!("Could not accept SCTP-over-UDP connection: max number of pending SCTP connections reached");
-            return;
-        };
-        let udp_link = Arc::new(udp_link);
-        let config = webrtc_sctp::association::Config {
-            net_conn: udp_link.clone(),
-            // set to 0 to use library defaults
-            max_receive_buffer_size: 0,
-            max_message_size: 0,
-            // following fields are only relevant for logging
-            name: "zenoh_server".to_owned(),
-            local_port: udp_link.src_addr.port(),
-            remote_port: udp_link.dst_addr.port(),
-        };
-        let acceptor_task = async {
+        let acceptor_task = async move {
+            let _permit = sctp_acceptors.acquire().await?;
+
+            let udp_link = Arc::new(udp_link);
+            let config = webrtc_sctp::association::Config {
+                net_conn: udp_link.clone(),
+                // set to 0 to use library defaults
+                max_receive_buffer_size: 0,
+                max_message_size: 0,
+                // following fields are only relevant for logging
+                name: "zenoh_server".to_owned(),
+                local_port: udp_link.src_addr.port(),
+                remote_port: udp_link.dst_addr.port(),
+            };
             let sctp_association = Association::server(config)
                 .await
                 .map_err(|e| format!("failed to create SCTP association: {e}"))?;
