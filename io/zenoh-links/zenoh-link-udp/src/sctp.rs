@@ -9,7 +9,10 @@ use webrtc_sctp::{
 };
 use zenoh_core::bail;
 use zenoh_link_commons::{LinkAuthId, LinkUnicast, LinkUnicastTrait, NewLinkChannelSender};
-use zenoh_protocol::{core::Locator, transport::BatchSize};
+use zenoh_protocol::{
+    core::{Locator, Priority},
+    transport::BatchSize,
+};
 use zenoh_result::{zerror, ZResult};
 
 use crate::LinkUnicastUdp;
@@ -28,7 +31,7 @@ impl webrtc_util::Conn for LinkUnicastUdp {
     }
 
     async fn recv(&self, buf: &mut [u8]) -> WebRtcUtilResult<usize> {
-        self.read(buf)
+        self.read(buf, Priority::Control)
             .await
             .map_err(|e| webrtc_util::Error::Other(e.to_string()))
     }
@@ -38,7 +41,7 @@ impl webrtc_util::Conn for LinkUnicastUdp {
     }
 
     async fn send(&self, buf: &[u8]) -> WebRtcUtilResult<usize> {
-        self.write(buf)
+        self.write(buf, Priority::Control)
             .await
             .map_err(|e| webrtc_util::Error::Other(e.to_string()))
     }
@@ -182,24 +185,24 @@ impl LinkUnicastTrait for LinkUnicastSctp {
         Ok(self.sctp_association.close().await?)
     }
 
-    async fn write(&self, buffer: &[u8]) -> ZResult<usize> {
+    async fn write(&self, buffer: &[u8], _prio: Priority) -> ZResult<usize> {
         // This copy is necessary, calls to write return before finishing to write on the wire
         Ok(self.stream.write(&Bytes::copy_from_slice(buffer)).await?)
     }
 
-    async fn write_all(&self, buffer: &[u8]) -> ZResult<()> {
+    async fn write_all(&self, buffer: &[u8], prio: Priority) -> ZResult<()> {
         let mut written: usize = 0;
         while written < buffer.len() {
-            written += self.write(&buffer[written..]).await?;
+            written += self.write(&buffer[written..], prio).await?;
         }
         Ok(())
     }
 
-    async fn read(&self, buffer: &mut [u8]) -> ZResult<usize> {
+    async fn read(&self, buffer: &mut [u8], _prio: Priority) -> ZResult<usize> {
         Ok(self.stream.read(buffer).await?)
     }
 
-    async fn read_exact(&self, buffer: &mut [u8]) -> ZResult<()> {
+    async fn read_exact(&self, buffer: &mut [u8], _prio: Priority) -> ZResult<()> {
         let mut read: usize = 0;
         while read < buffer.len() {
             let n = self.stream.read(&mut buffer[read..]).await?;
@@ -240,6 +243,11 @@ impl LinkUnicastTrait for LinkUnicastSctp {
         // SCTP is message-based stream multiplexing. Messages are delimited,
         // therefore it is not streamed as per Zenoh's definition of a streamed link
         false
+    }
+
+    #[inline(always)]
+    fn supports_priorities(&self) -> bool {
+        true
     }
 
     #[inline(always)]
