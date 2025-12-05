@@ -54,8 +54,9 @@ pub trait LinkUnicastTrait: Send + Sync {
     fn is_streamed(&self) -> bool;
     fn get_interface_names(&self) -> Vec<String>;
     fn get_auth_id(&self) -> &LinkAuthId;
-    fn supports_priorities(&self) -> bool {
-        false
+    /// (concurrent_tx, concurrent_rx)
+    fn supports_priorities(&self) -> (bool, bool) {
+        (false, false)
     }
     async fn write(&self, buffer: &[u8], priority: Priority) -> ZResult<usize>;
     async fn write_all(&self, buffer: &[u8], priority: Priority) -> ZResult<()>;

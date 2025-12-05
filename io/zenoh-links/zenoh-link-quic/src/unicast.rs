@@ -395,8 +395,8 @@ impl LinkUnicastTrait for LinkUnicastQuic {
     }
 
     #[inline(always)]
-    fn supports_priorities(&self) -> bool {
-        self.is_multistream
+    fn supports_priorities(&self) -> (bool, bool) {
+        (self.is_multistream, self.is_multistream)
     }
 }
 

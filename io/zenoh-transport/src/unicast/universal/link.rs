@@ -86,7 +86,7 @@ impl TransportLinkUnicastUniversal {
 
         // The pipeline
         let (producer, consumer) =
-            TransmissionPipeline::make(config, priority_tx, link.link.supports_priorities());
+            TransmissionPipeline::make(config, priority_tx, link.link.supports_priorities().0);
 
         let result = Self {
             link,
@@ -204,7 +204,7 @@ async fn tx_task(
     #[cfg(feature = "stats")] stats: Arc<TransportStats>,
 ) -> ZResult<()> {
     let keep_alive_tracker = TimeoutTracker::new(keep_alive);
-    if link.inner.link.supports_priorities() {
+    if link.inner.link.supports_priorities().0 {
         let (res, _, _) = select_all(pipeline.split().into_iter().map(|pipeline| {
             let mut link = link.clone();
             let token = token.clone();
@@ -328,7 +328,7 @@ async fn rx_task(
     let pool = RecyclingObjectPool::new(n, move || vec![0_u8; mtu].into_boxed_slice());
 
     let lease_tracker = TimeoutTracker::new(lease);
-    if link.link.supports_priorities() {
+    if link.link.supports_priorities().1 {
         let (res, _, _) = select_all((Priority::MAX as u8..Priority::MIN as u8).map(|prio| {
             let mut link = link.clone();
             let transport = transport.clone();

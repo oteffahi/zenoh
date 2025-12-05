@@ -327,8 +327,8 @@ impl LinkUnicastTrait for LinkUnicastSctp {
     }
 
     #[inline(always)]
-    fn supports_priorities(&self) -> bool {
-        true
+    fn supports_priorities(&self) -> (bool, bool) {
+        (true, true)
     }
 
     #[inline(always)]
