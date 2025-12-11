@@ -306,8 +306,10 @@ impl LinkUnicastTrait for LinkUnicastSctp {
 
     #[inline(always)]
     fn get_mtu(&self) -> BatchSize {
-        // TODO: check MTU computation for SCTP based on underlying UDP
-        self.udp_link.get_mtu()
+        self.sctp_association
+            .max_payload_size()
+            .try_into()
+            .expect("MTU should fit in u16 since it was initialized from LinkUnicastUDP")
     }
 
     #[inline(always)]
