@@ -101,6 +101,7 @@ impl LinkUnicastSctp {
                 name: "zenoh_server".to_owned(),
                 local_port: udp_link.src_addr.port(),
                 remote_port: udp_link.dst_addr.port(),
+                mtu: udp_link.get_mtu() as u32,
             };
             let sctp_association = Arc::new(
                 Association::server(config)
@@ -163,6 +164,7 @@ impl LinkUnicastSctp {
             name: "zenoh_client".to_owned(),
             local_port: udp_link.src_addr.port(),
             remote_port: udp_link.dst_addr.port(),
+            mtu: udp_link.get_mtu() as u32,
         };
         let open_sctp = async {
             let sctp_association = Arc::new(
