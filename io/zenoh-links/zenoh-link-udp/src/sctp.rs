@@ -101,7 +101,7 @@ impl LinkUnicastSctp {
                 name: "zenoh_server".to_owned(),
                 local_port: udp_link.src_addr.port(),
                 remote_port: udp_link.dst_addr.port(),
-                mtu: udp_link.get_mtu() as u32,
+                mtu: sctp_mtu_from_udp(udp_link.get_mtu()) as u32,
             };
             let sctp_association = Arc::new(
                 Association::server(config)
@@ -164,7 +164,7 @@ impl LinkUnicastSctp {
             name: "zenoh_client".to_owned(),
             local_port: udp_link.src_addr.port(),
             remote_port: udp_link.dst_addr.port(),
-            mtu: udp_link.get_mtu() as u32,
+            mtu: sctp_mtu_from_udp(udp_link.get_mtu()) as u32,
         };
         let open_sctp = async {
             let sctp_association = Arc::new(
@@ -332,7 +332,7 @@ impl LinkUnicastTrait for LinkUnicastSctp {
 
     #[inline(always)]
     fn supports_priorities(&self) -> (bool, bool) {
-        (true, true)
+        (false, true)
     }
 
     #[inline(always)]
@@ -429,4 +429,11 @@ fn get_stream_id_offset(is_client: bool) -> u16 {
         true => 0,
         false => Priority::NUM as u16 - 1,
     }
+}
+
+fn sctp_mtu_from_udp(udp_mtu: u16) -> u16 {
+    // NOTE: SCTP's underlying implementation has a tendency to write more than the passed MTU,
+    //       the amount, bas on exprimentation, is seemingly random depending on Zenoh payload
+    //       size. We therefore subtract a generous 64 bytes from the MTU.
+    udp_mtu - 64
 }
