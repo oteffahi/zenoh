@@ -151,6 +151,14 @@ path = "examples/z_pub_shm_thr.rs"
 required-features = ["shared-memory", "unstable"]
 
 [[example]]
+name = "z_pub_prios"
+path = "examples/z_pub_prios.rs"
+
+[[example]]
+name = "z_sub_prios"
+path = "examples/z_sub_prios.rs"
+
+[[example]]
 name = "z_ping"
 path = "examples/z_ping.rs"
 
