@@ -1349,24 +1349,22 @@ impl<Handler> AdvancedSubscriber<Handler> {
                             state.periodic_task =
                                 spawn_periodic_queries(&statesref, states.period, source_id);
                         }
-                        // Whole-sample recovery is needed when there is a gap in
-                        // sequence numbers (smallest pending SN != last_delivered+1)
-                        // or the smallest pending entry is still incomplete. The
-                        // previous condition fired when the first pending entry was
-                        // *complete*, which is the opposite of what we want.
-                        // TODO: the "first entry incomplete" disjunct fires for
-                        // every in-order fragmented sample on its first fragment,
-                        // causing an immediate whole-sample recovery query per
-                        // fragmented publication even under no-loss conditions.
-                        let needs_recovery = !state.pending_samples.is_empty()
-                            && (state.pending_samples.keys().next().copied()
-                                != state.last_delivered.map(|l| l + 1)
-                                || state
-                                    .pending_samples
-                                    .values()
-                                    .next()
-                                    .map(|fs| !fs.is_complete())
-                                    .unwrap_or(false));
+                        // Whole-sample recovery is needed only when there is a gap
+                        // in sequence numbers (smallest pending SN !=
+                        // last_delivered + 1). An incomplete smallest entry (a
+                        // fragmented sample still missing fragments) is not a
+                        // whole-sample recovery condition: it is handled by the
+                        // fragment recovery task (`spawn_frag_recovery`), which
+                        // waits `frag_recovery_delay` before issuing targeted
+                        // `_fn`-range queries and sends nothing under no-loss
+                        // conditions. Likewise, while `last_delivered` is `None`
+                        // no baseline has been established yet (e.g. the first
+                        // sample of a source is still being assembled), so no gap
+                        // can be detected.
+                        let needs_recovery = state.last_delivered.is_some()
+                            && !state.pending_samples.is_empty()
+                            && state.pending_samples.keys().next().copied()
+                                != state.last_delivered.map(|l| l + 1);
                         if retransmission.is_some() && state.pending_queries == 0 && needs_recovery
                         {
                             state.pending_queries += 1;
