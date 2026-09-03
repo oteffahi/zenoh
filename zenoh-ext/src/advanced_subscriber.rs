@@ -2414,3 +2414,175 @@ impl IntoFuture for SampleMissListenerBuilder<'_, Callback<Miss>, true> {
         std::future::ready(self.wait())
     }
 }
+
+#[cfg(all(test, feature = "unstable"))]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use zenoh::{
+        bytes::ZBytes,
+        config::{Config, WhatAmI},
+        internal::ztimeout,
+        query::Query,
+        sample::{FragInfo, SampleBuilder},
+    };
+
+    use super::*;
+    use crate::AdvancedPublisherBuilderExt;
+
+    /// 12-byte payload, 3 fragments of 4 bytes with `fragmentation(4)`.
+    const PAYLOAD: &str = "0123456789AB";
+    const TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Only the middle fragment of a 3-fragment sample is fed to
+    /// `handle_sample`; the missing fragments must be recovered from the
+    /// publisher's cache via `_sn`/`_fn`-range queries and reassembled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_recovery_of_missing_fragments() {
+        zenoh_util::init_log_from_env_or("error");
+
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.set_mode(Some(WhatAmI::Peer)).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+
+        // Records query selectors; replies an error so `session.get` (target
+        // `All`) completes immediately instead of at `query_timeout`.
+        let spy_queries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let _spy = {
+            let spy_queries = spy_queries.clone();
+            ztimeout!(session
+                .declare_queryable("test/ext/frag/recovery/@adv/**")
+                .callback(move |q: Query| {
+                    spy_queries.lock().unwrap().push(q.selector().to_string());
+                    let _ = q.reply_err(ZBytes::new()).wait();
+                }))
+            .unwrap()
+        };
+
+        // Publisher cache answers the recovery queries.
+        let publ = ztimeout!(session
+            .declare_publisher("test/ext/frag/recovery")
+            .advanced()
+            .fragmentation(4)
+            .cache(crate::CacheConfig::default().max_samples(10))
+            .sample_miss_detection(crate::MissDetectionConfig::default()))
+        .unwrap();
+        let source_id = publ.id();
+        ztimeout!(publ.put(PAYLOAD)).unwrap();
+
+        // Reassembly state of an advanced subscriber with recovery enabled.
+        let key_expr = KeyExpr::try_from("test/ext/frag/recovery").unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let statesref = {
+            let received = received.clone();
+            Arc::new_cyclic(|weak| {
+                Mutex::new(State {
+                    next_id: 0,
+                    global_pending_queries: 0,
+                    sequenced_states: LruCache::unbounded(),
+                    timestamped_states: LruCache::unbounded(),
+                    session: session.downgrade(),
+                    key_expr: key_expr.clone().into_owned(),
+                    retransmission: true,
+                    period: None,
+                    max_history_depth: 10,
+                    query_target: QueryTarget::All,
+                    query_timeout: Duration::from_secs(10),
+                    max_fragments: MAX_FRAGMENTS_DEFAULT,
+                    callback: Some(Callback::from(move |s: Sample| {
+                        received.lock().unwrap().push(s);
+                    })),
+                    miss_handlers: HashMap::new(),
+                    token: None,
+                    _gc_task: AbortOnDropHandle::new(
+                        ZRuntime::Application
+                            .spawn(gc_task(weak.clone(), Duration::from_secs(3600))),
+                    ),
+                })
+            })
+        };
+
+        let frag1: Sample = SampleBuilder::put(key_expr.clone(), "4567")
+            .frag_info(FragInfo::new(3, 1))
+            .source_info(SourceInfo::new(source_id, 0))
+            .into();
+        let source_info = frag1.source_info().cloned().unwrap();
+
+        let (new_source, new_frag) = {
+            let mut states = zlock!(statesref);
+            handle_sample(&mut states, frag1)
+        };
+        assert!(new_source);
+        assert!(new_frag);
+
+        // Arm the fragment recovery timer like the live callback does (the
+        // handle must be stored, else the task is aborted).
+        let handle = spawn_frag_recovery(
+            statesref.clone(),
+            key_expr.clone().into_owned(),
+            Some(&source_info),
+            Some(RecoveryConfig::default().fragments_recovery_delay(Duration::from_millis(500))),
+        )
+        .expect("fragment recovery task must spawn");
+        zlock!(statesref)
+            .sequenced_states
+            .get_mut(&source_id)
+            .unwrap()
+            .frag_recovery_task = Some(handle);
+
+        // Wait for reassembled delivery: fragments 0 and 2 must have come
+        // from the cache, and no raw fragment must leak through.
+        let mut delivered = None;
+        for _ in 0..100 {
+            if let Some(s) = received.lock().unwrap().first() {
+                delivered = Some(s.payload().try_to_string().unwrap().to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The reassembled payload proves fragments 0 and 2 arrived from the
+        // cache: the locally fed fragment only carried "4567".
+        assert_eq!(
+            delivered.as_deref(),
+            Some(PAYLOAD),
+            "fragmented sample was not recovered"
+        );
+        assert_eq!(received.lock().unwrap().len(), 1);
+
+        {
+            let mut states = zlock!(statesref);
+            let state = states.sequenced_states.get(&source_id).unwrap();
+            assert!(state.pending_samples.is_empty());
+            assert_eq!(state.last_delivered, Some(WrappingSn(0)));
+        }
+
+        // One query per missing fragment range: `_fn=0..0` and `_fn=2..`.
+        {
+            let queries = spy_queries.lock().unwrap();
+            assert_eq!(
+                queries.len(),
+                2,
+                "expected exactly one recovery query per missing fragment range: {queries:?}"
+            );
+            assert!(
+                queries.iter().all(|q| q.contains("_sn=0..0")),
+                "recovery queries must be scoped to SN 0: {queries:?}"
+            );
+            assert!(
+                queries.iter().any(|q| q.contains("_fn=0..0")),
+                "missing fragment range 0 must be queried: {queries:?}"
+            );
+            assert!(
+                queries.iter().any(|q| q.contains("_fn=2..;")),
+                "missing trailing fragment range must be queried: {queries:?}"
+            );
+        }
+
+        let _ = ztimeout!(session.close());
+    }
+}
