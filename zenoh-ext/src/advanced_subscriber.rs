@@ -62,6 +62,11 @@ use crate::{
     z_deserialize,
 };
 
+/// Default bound on the number of samples buffered per source for reordering
+/// and fragment reassembly. Overridable via
+/// [`AdvancedSubscriberBuilder::max_pending_samples`].
+pub(crate) const DEFAULT_MAX_PENDING_SAMPLES: usize = 100;
+
 #[derive(Debug, Default, Clone)]
 /// Configure query for historical data for [`history`](crate::AdvancedSubscriberBuilder::history) method.
 #[zenoh_macros::unstable]
@@ -85,6 +90,11 @@ impl HistoryConfig {
     }
 
     /// Specify how many samples to query for each resource.
+    ///
+    /// This also bounds the number of samples buffered per source for
+    /// reordering and fragment reassembly, unless
+    /// [`max_pending_samples`](AdvancedSubscriberBuilder::max_pending_samples)
+    /// is set.
     ///
     /// Builder will fail if `max_samples` is set to zero.
     #[zenoh_macros::unstable]
@@ -205,6 +215,7 @@ pub struct AdvancedSubscriberBuilder<'a, 'b, 'c, Handler, const BACKGROUND: bool
     pub(crate) query_target: QueryTarget,
     pub(crate) query_timeout: Duration,
     pub(crate) max_fragments: u32,
+    pub(crate) max_pending_samples: Option<usize>,
     pub(crate) history: Option<HistoryConfig>,
     pub(crate) liveliness: bool,
     pub(crate) meta_key_expr: Option<ZResult<KeyExpr<'c>>>,
@@ -224,6 +235,7 @@ impl<Handler, const BACKGROUND: bool> fmt::Debug
             .field("query_target", &self.query_target)
             .field("query_timeout", &self.query_timeout)
             .field("max_fragments", &self.max_fragments)
+            .field("max_pending_samples", &self.max_pending_samples)
             .field("history", &self.history)
             .field("liveliness", &self.liveliness)
             .field("meta_key_expr", &self.meta_key_expr)
@@ -246,6 +258,7 @@ impl<'a, 'b, Handler> AdvancedSubscriberBuilder<'a, 'b, '_, Handler> {
             query_target: QueryTarget::All,
             query_timeout: Duration::from_secs(10),
             max_fragments: MAX_FRAGMENTS_DEFAULT,
+            max_pending_samples: None,
             history: None,
             liveliness: false,
             meta_key_expr: None,
@@ -296,6 +309,7 @@ impl<'a, 'b, 'c> AdvancedSubscriberBuilder<'a, 'b, 'c, DefaultHandler> {
             query_target: self.query_target,
             query_timeout: self.query_timeout,
             max_fragments: self.max_fragments,
+            max_pending_samples: self.max_pending_samples,
             history: self.history,
             liveliness: self.liveliness,
             meta_key_expr: self.meta_key_expr,
@@ -318,6 +332,7 @@ impl<'a, 'b, 'c> AdvancedSubscriberBuilder<'a, 'b, 'c, Callback<Sample>> {
             query_target: self.query_target,
             query_timeout: self.query_timeout,
             max_fragments: self.max_fragments,
+            max_pending_samples: self.max_pending_samples,
             history: self.history,
             liveliness: self.liveliness,
             meta_key_expr: self.meta_key_expr,
@@ -343,6 +358,9 @@ impl<'a, 'c, Handler, const BACKGROUND: bool>
     /// Retransmission can only be achieved by [`AdvancedPublishers`](crate::AdvancedPublisher)
     /// that enable [`cache`](crate::AdvancedPublisherBuilder::cache) and
     /// [`sample_miss_detection`](crate::AdvancedPublisherBuilder::sample_miss_detection).
+    ///
+    /// Samples buffered while awaiting retransmission are bounded: see
+    /// [`max_pending_samples`](AdvancedSubscriberBuilder::max_pending_samples).
     #[zenoh_macros::unstable]
     #[inline]
     pub fn recovery(mut self, conf: RecoveryConfig) -> Self {
@@ -376,6 +394,23 @@ impl<'a, 'c, Handler, const BACKGROUND: bool>
     #[inline]
     pub fn max_fragments(mut self, max: u32) -> Self {
         self.max_fragments = max;
+        self
+    }
+
+    /// Set the maximum number of samples buffered per source.
+    ///
+    /// Samples are buffered for reordering and fragment reassembly. When the
+    /// buffer exceeds this bound, the oldest entry is delivered if complete,
+    /// otherwise discarded and reported as missed through
+    /// [`sample_miss_listener`](AdvancedSubscriber::sample_miss_listener).
+    ///
+    /// This setting takes precedence over
+    /// [`HistoryConfig::max_samples`](crate::HistoryConfig::max_samples). It
+    /// defaults to 100. Resolving a builder with `max` set to zero will fail.
+    #[zenoh_macros::unstable]
+    #[inline]
+    pub fn max_pending_samples(mut self, max: usize) -> Self {
+        self.max_pending_samples = Some(max);
         self
     }
 
@@ -419,6 +454,7 @@ impl<'a, 'c, Handler, const BACKGROUND: bool>
             query_target: self.query_target,
             query_timeout: self.query_timeout,
             max_fragments: self.max_fragments,
+            max_pending_samples: self.max_pending_samples,
             history: self.history,
             liveliness: self.liveliness,
             meta_key_expr: self.meta_key_expr.map(|s| s.map(|s| s.into_owned())),
@@ -750,9 +786,8 @@ fn maybe_evict_oldest(
     max_history_depth: usize,
 ) {
     // Use `>` so that a single in-flight fragmented sample is not evicted
-    // immediately under `max_history_depth == 1`.  Memory is still bounded by
+    // immediately under `max_history_depth == 1`. Memory is still bounded by
     // the per-slot `max_fragments` limit.
-    // TODO: check if `max_history_depth` can be 0
     while state.pending_samples.len() > max_history_depth.max(1) {
         let (sn, fs) = state
             .pending_samples
@@ -1297,6 +1332,9 @@ impl<Handler> AdvancedSubscriber<Handler> {
         {
             bail!("frag_recovery_delay must not be zero")
         }
+        if conf.max_pending_samples.is_some_and(|m| m == 0) {
+            bail!("max_pending_samples must not be zero")
+        }
         let (callback, receiver) = conf.handler.into_handler();
         let key_expr = conf.key_expr?;
         let meta = match conf.meta_key_expr {
@@ -1307,11 +1345,9 @@ impl<Handler> AdvancedSubscriber<Handler> {
         let query_target = conf.query_target;
         let query_timeout = conf.query_timeout;
         let max_history_depth = conf
-            .history
-            .as_ref()
-            .and_then(|h| h.max_samples)
-            // If the query is not bounded with `_max`, then it can receive unbounded number of responses
-            .unwrap_or(usize::MAX);
+            .max_pending_samples
+            .or(conf.history.as_ref().and_then(|h| h.max_samples))
+            .unwrap_or(DEFAULT_MAX_PENDING_SAMPLES);
         let retention_period = retransmission
             .as_ref()
             .and_then(|r| r.retention_period)
@@ -2455,7 +2491,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::AdvancedPublisherBuilderExt;
+    use crate::{AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt};
 
     /// 12-byte payload, 3 fragments of 4 bytes with `fragmentation(4)`.
     const PAYLOAD: &str = "0123456789AB";
@@ -2744,6 +2780,179 @@ mod tests {
             );
         }
 
+        let _ = ztimeout!(session.close());
+    }
+
+    /// Build a reassembly state with no retransmission and the given
+    /// `max_history_depth`, collecting deliveries and misses.
+    fn pending_bound_state(
+        session: &Session,
+        max_history_depth: usize,
+        received: Arc<Mutex<Vec<Sample>>>,
+        misses: Arc<Mutex<Vec<u32>>>,
+    ) -> Arc<Mutex<State>> {
+        Arc::new(Mutex::new(State {
+            next_id: 0,
+            global_pending_queries: 0,
+            sequenced_states: LruCache::unbounded(),
+            timestamped_states: LruCache::unbounded(),
+            session: session.downgrade(),
+            key_expr: KeyExpr::try_from("test/ext/pending").unwrap(),
+            retransmission: false,
+            period: None,
+            max_history_depth,
+            query_target: QueryTarget::All,
+            query_timeout: Duration::from_secs(10),
+            max_fragments: MAX_FRAGMENTS_DEFAULT,
+            callback: Some(Callback::from(move |s: Sample| {
+                received.lock().unwrap().push(s);
+            })),
+            miss_handlers: HashMap::from([(
+                0,
+                Callback::from(move |m: Miss| misses.lock().unwrap().push(m.nb())),
+            )]),
+            token: None,
+            _gc_task: AbortOnDropHandle::new(ZRuntime::Application.spawn(std::future::pending())),
+        }))
+    }
+
+    /// An incomplete head sample must not block delivery forever: once the
+    /// pending buffer exceeds its bound, the incomplete head is reported as
+    /// missed and the complete successors are delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pending_bound_unblocks_incomplete_head() {
+        zenoh_util::init_log_from_env_or("error");
+        let session = ztimeout!(zenoh::open(Config::default())).unwrap();
+        let source_id = EntityGlobalId::new(ZenohId::default(), 7);
+        let key_expr = KeyExpr::try_from("test/ext/pending").unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let statesref = pending_bound_state(&session, 4, received.clone(), misses.clone());
+
+        let handle = |s: Sample| {
+            let mut states = zlock!(statesref);
+            let _ = handle_sample(&mut states, s);
+        };
+        let frag = |sn: u32, num: u32, p: &str| {
+            SampleBuilder::put(key_expr.clone(), p)
+                .frag_info(FragInfo::new(3, num))
+                .source_info(SourceInfo::new(source_id, sn))
+                .into()
+        };
+
+        // No baseline delivered yet (`last_delivered` is `None`), so every
+        // sample takes the in-order path and only the eviction reports a miss.
+        // SN 1 arrives incomplete (frag 1 missing) and blocks the head.
+        handle(frag(1, 0, "ab"));
+        handle(frag(1, 2, "ef"));
+
+        // Complete fragmented successors fill the buffer until the bound.
+        for (sn, p0, p1, p2) in [
+            (2u32, "ab", "cd", "ef"),
+            (3, "gh", "ij", "kl"),
+            (4, "mn", "op", "qr"),
+        ] {
+            for (num, p) in [(0u32, p0), (1, p1), (2, p2)] {
+                handle(frag(sn, num, p));
+            }
+        }
+        // Buffer at bound (4): SN 1 still blocks, nothing delivered yet.
+        assert!(received.lock().unwrap().is_empty());
+        assert_eq!(misses.lock().unwrap().len(), 0);
+
+        // Next sample exceeds the bound: SN 1 is missed, SN 2..4 flushed.
+        handle(frag(5, 0, "st"));
+        handle(frag(5, 1, "uv"));
+        handle(frag(5, 2, "wx"));
+
+        let got: Vec<String> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.payload().try_to_string().unwrap().to_string())
+            .collect();
+        assert_eq!(got, ["abcdef", "ghijkl", "mnopqr", "stuvwx"]);
+        assert_eq!(misses.lock().unwrap().len(), 1);
+
+        let mut states = zlock!(statesref);
+        let state = states.sequenced_states.get(&source_id).unwrap();
+        assert!(state.pending_samples.is_empty());
+        assert_eq!(state.last_delivered, Some(WrappingSn(5)));
+    }
+
+    /// Incomplete samples must not accumulate beyond the pending bound: the
+    /// oldest are discarded and reported as missed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pending_bound_enforced() {
+        zenoh_util::init_log_from_env_or("error");
+        let session = ztimeout!(zenoh::open(Config::default())).unwrap();
+        let source_id = EntityGlobalId::new(ZenohId::default(), 7);
+        let key_expr = KeyExpr::try_from("test/ext/pending").unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let statesref = pending_bound_state(&session, 4, received.clone(), misses.clone());
+
+        for sn in 0u32..10 {
+            let s: Sample = SampleBuilder::put(key_expr.clone(), "x")
+                .frag_info(FragInfo::new(3, 0))
+                .source_info(SourceInfo::new(source_id, sn))
+                .into();
+            let mut states = zlock!(statesref);
+            let _ = handle_sample(&mut states, s);
+        }
+
+        // 6 of the 10 incomplete samples evicted, 4 kept, none delivered.
+        assert_eq!(misses.lock().unwrap().len(), 6);
+        assert!(received.lock().unwrap().is_empty());
+        let mut states = zlock!(statesref);
+        let state = states.sequenced_states.get(&source_id).unwrap();
+        assert_eq!(state.pending_samples.len(), 4);
+    }
+
+    /// The `max_pending_samples` knob overrides `history.max_samples` and
+    /// defaults to `DEFAULT_MAX_PENDING_SAMPLES`; zero is rejected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_max_pending_samples_builder() {
+        zenoh_util::init_log_from_env_or("error");
+        let session = ztimeout!(zenoh::open(Config::default())).unwrap();
+
+        let sub = ztimeout!(session
+            .declare_subscriber("test/ext/mps/a")
+            .advanced()
+            .max_pending_samples(7))
+        .unwrap();
+        assert_eq!(zlock!(sub.statesref).max_history_depth, 7);
+
+        let sub2 = ztimeout!(session
+            .declare_subscriber("test/ext/mps/b")
+            .advanced()
+            .history(HistoryConfig::default().max_samples(5)))
+        .unwrap();
+        assert_eq!(zlock!(sub2.statesref).max_history_depth, 5);
+
+        let sub3 = ztimeout!(session
+            .declare_subscriber("test/ext/mps/c")
+            .advanced()
+            .history(HistoryConfig::default().max_samples(5))
+            .max_pending_samples(9))
+        .unwrap();
+        assert_eq!(zlock!(sub3.statesref).max_history_depth, 9);
+
+        let sub4 = ztimeout!(session.declare_subscriber("test/ext/mps/d").advanced()).unwrap();
+        assert_eq!(
+            zlock!(sub4.statesref).max_history_depth,
+            DEFAULT_MAX_PENDING_SAMPLES
+        );
+
+        let zero = ztimeout!(session
+            .declare_subscriber("test/ext/mps/z")
+            .advanced()
+            .max_pending_samples(0));
+        assert!(zero.is_err());
+
+        drop((sub, sub2, sub3, sub4));
         let _ = ztimeout!(session.close());
     }
 }
