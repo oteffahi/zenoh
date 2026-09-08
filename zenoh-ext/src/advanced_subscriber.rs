@@ -2485,10 +2485,11 @@ mod tests {
     use zenoh::{
         bytes::ZBytes,
         config::{Config, WhatAmI},
-        internal::ztimeout,
+        internal::{traits::SampleBuilderTrait, ztimeout},
         query::Query,
         sample::{FragInfo, SampleBuilder},
     };
+    use zenoh_config::ModeDependentValue;
 
     use super::*;
     use crate::{AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt};
@@ -2953,6 +2954,89 @@ mod tests {
         assert!(zero.is_err());
 
         drop((sub, sub2, sub3, sub4));
+        let _ = ztimeout!(session.close());
+    }
+
+    /// The publisher timestamps only fragment 0 and attaches only to
+    /// fragment 0; the assembled sample delivered to the user carries
+    /// fragment 0's timestamp and attachment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_fragment_timestamp_on_first_fragment() {
+        zenoh_util::init_log_from_env_or("error");
+
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.set_mode(Some(WhatAmI::Peer)).unwrap();
+        config
+            .timestamping
+            .set_enabled(Some(ModeDependentValue::Unique(true)))
+            .unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        assert!(session.hlc().is_some());
+
+        let sub = ztimeout!(session.declare_subscriber("test/ext/frag/ts").advanced()).unwrap();
+        let publ = ztimeout!(session
+            .declare_publisher("test/ext/frag/ts")
+            .advanced()
+            .fragmentation(4)
+            .cache(crate::CacheConfig::default().max_samples(10))
+            .sample_miss_detection(crate::MissDetectionConfig::default()))
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        ztimeout!(publ.put(PAYLOAD).attachment("attach")).unwrap();
+        let delivered = ztimeout!(sub.recv_async()).unwrap();
+        let ts_delivered = delivered.timestamp().copied();
+        assert_eq!(
+            delivered.attachment().unwrap().to_bytes().as_ref(),
+            b"attach",
+            "assembled sample must carry the attachment"
+        );
+
+        // Query the cache for fragment 0 of SN 0.
+        let frags = Arc::new(Mutex::new(Vec::<(u32, Option<Timestamp>, bool)>::new()));
+        let _ = ztimeout!(session
+            .get(Selector::from((
+                KeyExpr::try_from("test/ext/frag/ts/@adv/**").unwrap(),
+                "_sn=0..0".to_string(),
+            )))
+            .callback({
+                let frags = frags.clone();
+                move |r: Reply| {
+                    if let Ok(s) = r.into_result() {
+                        if let Some(fi) = s.frag_info() {
+                            frags.lock().unwrap().push((
+                                fi.frag_num(),
+                                s.timestamp().copied(),
+                                s.attachment().is_some(),
+                            ));
+                        }
+                    }
+                }
+            })
+            .consolidation(ConsolidationMode::None)
+            .accept_replies(ReplyKeyExpr::Any)
+            .target(QueryTarget::All)
+            .timeout(Duration::from_secs(10)));
+
+        {
+            let mut frags = frags.lock().unwrap();
+            frags.sort_by_key(|(num, _, _)| *num);
+            assert_eq!(frags.len(), 3, "expected all 3 fragments from cache");
+            let (_, ts_frag0, att_frag0) = frags[0];
+            assert_eq!(
+                ts_delivered, ts_frag0,
+                "assembled sample must carry fragment 0's timestamp"
+            );
+            assert!(ts_frag0.is_some(), "fragment 0 must be timestamped");
+            assert!(att_frag0, "fragment 0 must carry the attachment");
+            assert!(
+                frags[1..].iter().all(|(_, ts, att)| ts.is_none() && !att),
+                "fragments other than 0 must carry neither attachment nor publisher timestamp"
+            );
+        }
+
+        drop((sub, publ));
         let _ = ztimeout!(session.close());
     }
 }

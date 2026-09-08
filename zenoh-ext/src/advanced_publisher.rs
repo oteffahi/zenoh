@@ -245,6 +245,11 @@ impl<'a, 'b, 'c> AdvancedPublisherBuilder<'a, 'b, 'c> {
     /// [`sample_miss_detection`](Self::sample_miss_detection). Enable sequencing
     /// on the builder before resolving it; resolving a builder with fragmentation
     /// but without sequencing will fail.
+    ///
+    /// Each fragment is published as an independent sample: subscribers that
+    /// are not [`AdvancedSubscriber`](crate::AdvancedSubscriber) receive
+    /// the raw fragments with partial payloads. Only the first fragment
+    /// is timestamped by the publisher, and carries the full attachment of the message.
     #[zenoh_macros::unstable]
     #[inline]
     pub fn fragmentation(self, size: usize) -> Self {
@@ -820,10 +825,11 @@ impl Wait for AdvancedPublisherPutBuilder<'_> {
             self.builder = self.builder.source_info(info);
         }
         if let Some(size) = self.publisher.fragmentation {
-            // TODO: check payload length before materializing with `to_bytes()`
-            // to avoid a copy for small multi-slice payloads.
-            let bytes = self.builder.payload_ref().to_bytes();
-            if bytes.len() > size {
+            let payload = self.builder.payload_ref();
+            if payload.len() > size {
+                // `to_bytes` is only called if fragmentation is necessary,
+                // to avoid copy for small messages.
+                let bytes = payload.to_bytes();
                 let chunks = bytes.chunks(size);
                 let frag_count = chunks.len();
                 let mut fragments = vec![];
@@ -834,19 +840,23 @@ impl Wait for AdvancedPublisherPutBuilder<'_> {
                         .clone()
                         .payload(chunk)
                         .frag_info(FragInfo::new(frag_count as u32, i as u32));
-                    if let Some(hlc) = self.publisher.publisher.session().hlc() {
-                        builder = builder.timestamp(hlc.new_timestamp());
+                    match i {
+                        0 => {
+                            // fragment 0 carries timestamp and attachment of original message
+                            if let Some(hlc) = self.publisher.publisher.session().hlc() {
+                                builder = builder.timestamp(hlc.new_timestamp());
+                            }
+                        }
+                        _ => {
+                            // clear timestamp and attachment for fragments that aren't frag 0
+                            // NOTE: timestamp is cleared here to avoid duplicate HLC clock values
+                            builder = builder.timestamp(None).attachment(None::<ZBytes>);
+                        }
                     }
                     fragments.push(zenoh::sample::Sample::from(&builder));
                     builders.push(builder);
                 }
                 if let Some(cache) = self.publisher.cache.as_ref() {
-                    // FIXME: each fragment carries the full attachment/timestamp
-                    // of the original sample; `cache_fragments` stores them
-                    // fragment-by-fragment. The cache currently replies with one
-                    // fragment per reply, so the same attachment is duplicated on
-                    // the wire. Decide whether history should store one canonical
-                    // reassembled sample and reply whole samples instead.
                     cache.cache_fragments(fragments);
                 }
                 for builder in builders {

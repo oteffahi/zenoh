@@ -128,6 +128,51 @@ async fn test_fragmentation_builder_order_independent() {
     .unwrap();
 }
 
+// A multi-slice `ZBytes` payload must be fragmented and reassembled
+// correctly; a multi-slice payload at or below the threshold must be
+// delivered as a single unfragmented sample.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_fragmentation_multislice_payload() {
+    zenoh_util::init_log_from_env_or("error");
+    let (peer1, peer2) = create_peer_pair().await;
+
+    let sub = ztimeout!(peer2
+        .declare_subscriber("test/fragmentation/multislice")
+        .advanced())
+    .unwrap();
+    tokio::time::sleep(SLEEP).await;
+
+    let publ = ztimeout!(peer1
+        .declare_publisher("test/fragmentation/multislice")
+        .advanced()
+        .fragmentation(4)
+        .sample_miss_detection(MissDetectionConfig::default()))
+    .unwrap();
+
+    // 24 bytes across two slices, fragmentation(4) -> 6 fragments.
+    let mut writer = zenoh::bytes::ZBytes::writer();
+    writer.append(zenoh::bytes::ZBytes::from("abcdefghijklmnop"));
+    writer.append(zenoh::bytes::ZBytes::from("qrstuvwx"));
+    let payload = writer.finish();
+    ztimeout!(publ.put(payload.clone())).unwrap();
+
+    let sample = ztimeout!(sub.recv_async()).unwrap();
+    assert_eq!(sample.payload(), &payload);
+    assert!(sub.try_recv().unwrap().is_none());
+
+    // 4 bytes across two slices, exactly at the threshold: single sample.
+    let mut writer = zenoh::bytes::ZBytes::writer();
+    writer.append(zenoh::bytes::ZBytes::from("ab"));
+    writer.append(zenoh::bytes::ZBytes::from("cd"));
+    let payload = writer.finish();
+    ztimeout!(publ.put(payload.clone())).unwrap();
+
+    let sample = ztimeout!(sub.recv_async()).unwrap();
+    assert_eq!(sample.payload(), &payload);
+    assert!(sample.frag_info().is_none());
+    assert!(sub.try_recv().unwrap().is_none());
+}
+
 // In-order fragmented publications under no-loss conditions must not trigger
 // any recovery query: whole-sample recovery fires only on sequence-number
 // gaps, and the fragment recovery timer finds the sample complete when it

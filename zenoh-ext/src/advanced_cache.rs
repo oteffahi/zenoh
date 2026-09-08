@@ -295,10 +295,6 @@ impl AdvancedCache {
                             }
                             frange_unbounded || sample.iter_frags().any(frag_matches)
                         };
-                        // FIXME: the cache stores fragments (with duplicated
-                        // attachments/timestamps per fragment) and replies with
-                        // one fragment per reply. Reassemble the original sample
-                        // here and reply a single whole sample instead.
                         let reply_frag = |frag: &Sample| {
                             if let Err(e) = query
                                 .reply_sample(
