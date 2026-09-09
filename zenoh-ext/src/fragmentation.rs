@@ -126,6 +126,8 @@ impl FragmentedSample {
 
     /// Insert a fragment into this slot.
     ///
+    /// Duplicate fragments overwrite previously stored ones.
+    ///
     /// # Errors
     /// * `InvalidFragNum` if `frag_num >= frag_count`.
     /// * `InvalidFragCount` if `frag_count == 0`.
@@ -148,7 +150,7 @@ impl FragmentedSample {
         match self {
             Self::Single(_) => {
                 if frag_count == 1 {
-                    // duplicate of a single-fragment sample; keep existing
+                    *self = Self::Single(sample);
                     return Ok(());
                 }
                 // A Single only exists when the sample was advertised as a
@@ -169,14 +171,7 @@ impl FragmentedSample {
                         got: frag_count,
                     });
                 }
-                let slot = &mut frags[frag_num as usize];
-                if slot.is_some() {
-                    tracing::trace!(
-                        "AdvancedSubscriber: duplicate fragment {frag_num}/{frag_count} ignored"
-                    );
-                    return Ok(());
-                }
-                *slot = Some(sample);
+                frags[frag_num as usize] = Some(sample);
                 Ok(())
             }
         }
@@ -382,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_duplicate_no_overwrite() {
+    fn insert_fragment_duplicate_overwrites() {
         let s0 = make_sample("A", 0, 3);
         let s0_dup = make_sample("X", 0, 3);
         let s1 = make_sample("B", 1, 3);
@@ -390,11 +385,27 @@ mod tests {
 
         let mut fs =
             FragmentedSample::from_first_fragment(s0, 0, 3, MAX_FRAGMENTS_DEFAULT).unwrap();
-        fs.insert(s0_dup, 0, 3).unwrap(); // duplicate, should be ignored
+        fs.insert(s0_dup, 0, 3).unwrap(); // duplicate, overwrites
         fs.insert(s1, 1, 3).unwrap();
         fs.insert(s2, 2, 3).unwrap();
 
         let sample = fs.into_sample().unwrap();
-        assert_eq!(sample.payload().try_to_string().unwrap().as_ref(), "ABC");
+        assert_eq!(sample.payload().try_to_string().unwrap().as_ref(), "XBC");
+    }
+
+    #[test]
+    fn insert_single_duplicate_overwrites() {
+        let s = make_sample("A", 0, 1);
+        let mut fs = FragmentedSample::single(s);
+        fs.insert(make_sample("X", 0, 1), 0, 1).unwrap();
+        assert_eq!(
+            fs.into_sample()
+                .unwrap()
+                .payload()
+                .try_to_string()
+                .unwrap()
+                .as_ref(),
+            "X"
+        );
     }
 }
