@@ -773,7 +773,8 @@ fn insert_fragment(
 /// If the buffer grows past the configured depth we drop the oldest entry so
 /// memory stays bounded. Complete samples are delivered (and any consecutive
 /// complete successors are flushed via [`deliver_and_flush`]); incomplete
-/// samples are reported as missed and discarded.
+/// samples are discarded without reporting: misses are accounted by
+/// [`deliver_and_flush`] when a delivery closes the gap.
 ///
 /// This is called after every insertion because fragments may arrive slowly and
 /// the head entry could stay incomplete for an unbounded time otherwise.
@@ -794,17 +795,14 @@ fn maybe_evict_oldest(
             .pop_first()
             .expect("non-empty pending_samples");
         if let Some(sample) = fs.into_sample() {
-            deliver_and_flush(sample, sn, callback, state);
+            deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
         } else {
+            // Miss accounting happens at delivery, not at eviction. Edge case:
+            // an incomplete entry evicted as the last pending entry with no
+            // later delivery is never reported.
             tracing::info!(
                 "AdvancedSubscriber: evicted incomplete sample at sn={sn} due to max_history_depth={max_history_depth}"
             );
-            for miss_callback in miss_handlers.values() {
-                miss_callback.call(Miss {
-                    source: source_id,
-                    nb: 1,
-                });
-            }
         }
     }
 }
@@ -849,9 +847,26 @@ fn deliver_and_flush(
     sample: Sample,
     source_sn: impl Into<WrappingSn>,
     callback: &Callback<Sample>,
+    miss_handlers: &HashMap<usize, Callback<Miss>>,
+    source_id: EntityGlobalId,
     state: &mut SourceState<WrappingSn>,
 ) {
     let mut source_sn = source_sn.into();
+    // Miss accounting is done here, on delivery of a full sample, not at
+    // eviction: a delivery skipping ahead of `last_delivered` reports the
+    // gap once. With no `last_delivered`, pre-join samples are unknown.
+    if let Some(last) = state.last_delivered {
+        if source_sn > last + 1 {
+            let missed = source_sn - last - 1;
+            tracing::info!("Sample missed: missed {missed} samples from {source_id:?}.");
+            for miss_callback in miss_handlers.values() {
+                miss_callback.call(Miss {
+                    source: source_id,
+                    nb: missed,
+                });
+            }
+        }
+    }
     callback.call(sample);
     state.last_delivered = Some(source_sn);
     while let Some(sample) = remove_and_defrag(&mut state.pending_samples, source_sn + 1) {
@@ -929,7 +944,14 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
                     // A recovered fragment may close the gap; try to flush.
                     if let Some(last) = state.last_delivered {
                         if let Some(s) = remove_and_defrag(&mut state.pending_samples, last + 1) {
-                            deliver_and_flush(s, last + 1, callback, state);
+                            deliver_and_flush(
+                                s,
+                                last + 1,
+                                callback,
+                                miss_handlers,
+                                source_id,
+                                state,
+                            );
                         }
                     }
                     maybe_evict_oldest(
@@ -941,18 +963,6 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
                     );
                     new_frag
                 } else {
-                    let missed = sn - state.last_delivered.unwrap() - 1;
-                    tracing::info!(
-                        "Sample missed: missed {} samples from {:?}.",
-                        missed,
-                        source_id,
-                    );
-                    for miss_callback in miss_handlers.values() {
-                        miss_callback.call(Miss {
-                            source: source_id,
-                            nb: missed,
-                        });
-                    }
                     if is_fragmented {
                         let _ = insert_fragment(state, sample, &source_info, max_fragments);
                         maybe_evict_oldest(
@@ -963,11 +973,11 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
                             max_history_depth,
                         );
                         if let Some((k, s)) = pop_and_defrag_first(&mut state.pending_samples) {
-                            deliver_and_flush(s, k, callback, state);
+                            deliver_and_flush(s, k, callback, miss_handlers, source_id, state);
                         }
                     } else {
-                        callback.call(sample);
-                        state.last_delivered = Some(sn);
+                        // Misses are reported by `deliver_and_flush` on delivery.
+                        deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
                     }
                     false
                 }
@@ -988,14 +998,14 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
                             max_history_depth,
                         );
                         if let Some((k, s)) = pop_and_defrag_first(&mut state.pending_samples) {
-                            deliver_and_flush(s, k, callback, state);
+                            deliver_and_flush(s, k, callback, miss_handlers, source_id, state);
                         }
                         new_frag
                     }
                     Err(()) => false,
                 }
             } else {
-                deliver_and_flush(sample, sn, callback, state);
+                deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
                 false
             }
         };
@@ -2031,35 +2041,10 @@ fn flush_sequenced_source(
         let mut pending_samples = BTreeMap::new();
         std::mem::swap(&mut state.pending_samples, &mut pending_samples);
         for (seq_num, frag_sample) in pending_samples {
-            let Some(sample) = frag_sample.into_sample() else {
-                continue;
-            };
-            match state.last_delivered {
-                None => {
-                    state.last_delivered = Some(seq_num);
-                    callback.call(sample);
-                }
-                Some(last) if seq_num == last + 1 => {
-                    state.last_delivered = Some(seq_num);
-                    callback.call(sample);
-                }
-                Some(last) if seq_num > last + 1 => {
-                    tracing::info!(
-                        "Sample missed: missed {} samples from {:?}.",
-                        seq_num - last - 1,
-                        source_id,
-                    );
-                    for miss_callback in miss_handlers.values() {
-                        miss_callback.call(Miss {
-                            source: *source_id,
-                            nb: seq_num - last - 1,
-                        })
-                    }
-                    state.last_delivered = Some(seq_num);
-                    callback.call(sample);
-                }
-                _ => {
-                    // duplicate
+            if let Some(sample) = frag_sample.into_sample() {
+                // Skip duplicates: they were already delivered.
+                if state.last_delivered.map_or(true, |last| seq_num > last) {
+                    deliver_and_flush(sample, seq_num, callback, miss_handlers, *source_id, state);
                 }
             }
         }
@@ -2181,6 +2166,9 @@ impl Drop for TimestampedRepliesHandler {
 }
 
 /// A struct that represent missed samples.
+///
+/// Reports are emitted when the delivery of a full sample crates a gap
+/// in sequence number, not at fragment reception or eviction.
 #[zenoh_macros::unstable]
 #[derive(Debug, Clone)]
 pub struct Miss {
@@ -2818,8 +2806,9 @@ mod tests {
     }
 
     /// An incomplete head sample must not block delivery forever: once the
-    /// pending buffer exceeds its bound, the incomplete head is reported as
-    /// missed and the complete successors are delivered.
+    /// pending buffer exceeds its bound, the incomplete head is discarded and
+    /// the complete successors are delivered. No miss is reported: delivery
+    /// with no `last_delivered` never closes a gap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_pending_bound_unblocks_incomplete_head() {
         zenoh_util::init_log_from_env_or("error");
@@ -2843,7 +2832,8 @@ mod tests {
         };
 
         // No baseline delivered yet (`last_delivered` is `None`), so every
-        // sample takes the in-order path and only the eviction reports a miss.
+        // sample takes the in-order path and nothing reports a miss: no
+        // delivery ever closes a gap.
         // SN 1 arrives incomplete (frag 1 missing) and blocks the head.
         handle(frag(1, 0, "ab"));
         handle(frag(1, 2, "ef"));
@@ -2874,7 +2864,7 @@ mod tests {
             .map(|s| s.payload().try_to_string().unwrap().to_string())
             .collect();
         assert_eq!(got, ["abcdef", "ghijkl", "mnopqr", "stuvwx"]);
-        assert_eq!(misses.lock().unwrap().len(), 1);
+        assert!(misses.lock().unwrap().is_empty());
 
         let mut states = zlock!(statesref);
         let state = states.sequenced_states.get(&source_id).unwrap();
@@ -2883,7 +2873,7 @@ mod tests {
     }
 
     /// Incomplete samples must not accumulate beyond the pending bound: the
-    /// oldest are discarded and reported as missed.
+    /// oldest are discarded without reporting a miss.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_pending_bound_enforced() {
         zenoh_util::init_log_from_env_or("error");
@@ -2904,12 +2894,98 @@ mod tests {
             let _ = handle_sample(&mut states, s);
         }
 
-        // 6 of the 10 incomplete samples evicted, 4 kept, none delivered.
-        assert_eq!(misses.lock().unwrap().len(), 6);
+        // 6 of the 10 incomplete samples evicted, 4 kept, none delivered,
+        // and eviction is silent.
+        assert!(misses.lock().unwrap().is_empty());
         assert!(received.lock().unwrap().is_empty());
         let mut states = zlock!(statesref);
         let state = states.sequenced_states.get(&source_id).unwrap();
         assert_eq!(state.pending_samples.len(), 4);
+    }
+
+    /// A delivery closing a gap reports the missed samples exactly once, when
+    /// the assembled sample is delivered: fragments of the sample crossing the
+    /// gap must not re-report.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_miss_reported_once_on_crossing_delivery() {
+        zenoh_util::init_log_from_env_or("error");
+        let session = ztimeout!(zenoh::open(Config::default())).unwrap();
+        let source_id = EntityGlobalId::new(ZenohId::default(), 7);
+        let key_expr = KeyExpr::try_from("test/ext/pending").unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let statesref = pending_bound_state(&session, 4, received.clone(), misses.clone());
+
+        let handle = |s: Sample| {
+            let mut states = zlock!(statesref);
+            let _ = handle_sample(&mut states, s);
+        };
+        let frag = |sn: u32, num: u32, p: &str| {
+            SampleBuilder::put(key_expr.clone(), p)
+                .frag_info(FragInfo::new(3, num))
+                .source_info(SourceInfo::new(source_id, sn))
+                .into()
+        };
+
+        // Baseline: SN 0 delivered in-order.
+        handle(
+            SampleBuilder::put(key_expr.clone(), "base")
+                .source_info(SourceInfo::new(source_id, 0))
+                .into(),
+        );
+
+        // SN 1 is lost; SN 2's fragments all cross the gap but only the
+        // assembled sample's delivery reports it.
+        for (num, p) in [(0u32, "ab"), (1, "cd"), (2, "ef")] {
+            handle(frag(2, num, p));
+        }
+
+        let got: Vec<String> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.payload().try_to_string().unwrap().to_string())
+            .collect();
+        assert_eq!(got, ["base", "abcdef"]);
+        assert_eq!(*misses.lock().unwrap(), [1]);
+    }
+
+    /// A non-fragmented sample closing a gap reports the skipped count on
+    /// delivery, preserving the pre-fragmentation behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_miss_jump_count_on_delivery() {
+        zenoh_util::init_log_from_env_or("error");
+        let session = ztimeout!(zenoh::open(Config::default())).unwrap();
+        let source_id = EntityGlobalId::new(ZenohId::default(), 7);
+        let key_expr = KeyExpr::try_from("test/ext/pending").unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let statesref = pending_bound_state(&session, 4, received.clone(), misses.clone());
+
+        let handle = |s: Sample| {
+            let mut states = zlock!(statesref);
+            let _ = handle_sample(&mut states, s);
+        };
+        let plain = |sn: u32, p: &str| {
+            SampleBuilder::put(key_expr.clone(), p)
+                .source_info(SourceInfo::new(source_id, sn))
+                .into()
+        };
+
+        handle(plain(0, "base"));
+        // SN 1 and 2 are lost; SN 3 closes the gap.
+        handle(plain(3, "jump"));
+
+        let got: Vec<String> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.payload().try_to_string().unwrap().to_string())
+            .collect();
+        assert_eq!(got, ["base", "jump"]);
+        assert_eq!(*misses.lock().unwrap(), [2]);
     }
 
     /// The `max_pending_samples` knob overrides `history.max_samples` and
