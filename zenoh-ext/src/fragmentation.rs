@@ -11,7 +11,7 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use zenoh::{bytes::ZBytes, sample::Sample};
+use zenoh::{bytes::ZBytes, internal::zerror, sample::Sample, Result as ZResult};
 
 /// Per-source DoS cap on the number of fragments a single sample may carry.
 ///
@@ -20,6 +20,24 @@ use zenoh::{bytes::ZBytes, sample::Sample};
 /// very large payloads.  Users can raise this limit via
 /// [`AdvancedSubscriberBuilder::max_fragments`](crate::AdvancedSubscriberBuilder::max_fragments).
 pub(crate) const MAX_FRAGMENTS_DEFAULT: u32 = 4096;
+
+/// Compute the number of fragments a `payload_len`-byte payload requires when
+/// split in `size`-byte fragments, checking it fits `u32` (the wire encoding
+/// of fragment metadata cannot represent more).
+///
+/// Subscriber-side fragment caps (for example
+/// [`AdvancedSubscriberBuilder::max_fragments`](crate::AdvancedSubscriberBuilder::max_fragments),
+/// defaulting to [`MAX_FRAGMENTS_DEFAULT`]) are enforced on the subscriber:
+/// fragments beyond a subscriber's cap are rejected, so publishing more
+/// fragments than a subscriber accepts results in that sample being dropped
+/// by that subscriber.
+///
+/// The caller guarantees `payload_len > 0 && size > 0`.
+pub(crate) fn fragment_count(payload_len: usize, size: usize) -> ZResult<u32> {
+    u32::try_from(payload_len.div_ceil(size)).map_err(|_| {
+        zerror!("payload of {payload_len} bytes would require more than u32::MAX fragments").into()
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) enum FragmentedSample {
@@ -249,7 +267,7 @@ mod tests {
         sample::{FragInfo, Sample, SampleBuilder},
     };
 
-    use super::{FragInsertError, FragmentedSample, MAX_FRAGMENTS_DEFAULT};
+    use super::{fragment_count, FragInsertError, FragmentedSample, MAX_FRAGMENTS_DEFAULT};
 
     fn make_sample(payload: &str, frag_num: u32, frag_count: u32) -> Sample {
         SampleBuilder::put(KeyExpr::try_from("test/key").unwrap(), payload)
@@ -407,5 +425,36 @@ mod tests {
                 .as_ref(),
             "X"
         );
+    }
+
+    #[test]
+    fn fragment_count_exact_division() {
+        assert_eq!(fragment_count(12, 4).unwrap(), 3);
+    }
+
+    #[test]
+    fn fragment_count_leaves_remainder() {
+        assert_eq!(fragment_count(13, 4).unwrap(), 4);
+    }
+
+    #[test]
+    fn fragment_count_fits_even_beyond_default_cap() {
+        // The subscriber-side cap is not enforced here: 4097 fragments exceed
+        // MAX_FRAGMENTS_DEFAULT but are representable on the wire.
+        assert_eq!(
+            fragment_count(MAX_FRAGMENTS_DEFAULT as usize + 1, 1).unwrap(),
+            MAX_FRAGMENTS_DEFAULT + 1
+        );
+    }
+
+    #[test]
+    fn fragment_count_max_u32() {
+        assert_eq!(fragment_count(u32::MAX as usize, 1).unwrap(), u32::MAX);
+    }
+
+    #[test]
+    fn fragment_count_overflow() {
+        assert!(fragment_count(u32::MAX as usize + 1, 1).is_err());
+        assert!(fragment_count(usize::MAX / 2, 1).is_err());
     }
 }

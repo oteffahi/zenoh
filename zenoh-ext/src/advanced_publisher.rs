@@ -30,7 +30,7 @@ use zenoh::{
             EncodingBuilderTrait, FragInfoBuilderTrait, QoSBuilderTrait, SampleBuilderTrait,
             TimestampBuilderTrait,
         },
-        TerminatableTask,
+        zerror, TerminatableTask,
     },
     key_expr::{keyexpr, KeyExpr},
     liveliness::LivelinessToken,
@@ -47,6 +47,7 @@ use zenoh_macros::ke;
 
 use crate::{
     advanced_cache::{AdvancedCache, AdvancedCacheBuilder, CacheConfig, KE_UHLC},
+    fragmentation::fragment_count,
     z_serialize,
 };
 
@@ -250,6 +251,14 @@ impl<'a, 'b, 'c> AdvancedPublisherBuilder<'a, 'b, 'c> {
     /// are not [`AdvancedSubscriber`](crate::AdvancedSubscriber) receive
     /// the raw fragments with partial payloads. Only the first fragment
     /// is timestamped by the publisher, and carries the full attachment of the message.
+    ///
+    /// A publication whose payload would require more than `u32::MAX`
+    /// fragments errors out at publication time. Fragment caps below that
+    /// are enforced on the subscriber side: most fragments must still comply
+    /// with each [`AdvancedSubscriber`](crate::AdvancedSubscriber)'s
+    /// `max_fragments` (default 4096), or that fragment is rejected by that
+    /// subscriber. `size` should be chosen so that typical payloads stay
+    /// within the receivers' caps.
     #[zenoh_macros::unstable]
     #[inline]
     pub fn fragmentation(self, size: usize) -> Self {
@@ -840,8 +849,16 @@ impl Wait for AdvancedPublisherPutBuilder<'_> {
                 // `to_bytes` is only called if fragmentation is necessary,
                 // to avoid copy for small messages.
                 let bytes = payload.to_bytes();
+                // NOTE: this consumes a sequence number even if the
+                // publication is refused, leaving a gap that subscribers will
+                // account for.
+                let frag_count = fragment_count(bytes.len(), size).map_err(|e| {
+                    zerror!(
+                        "AdvancedPublisher{{key_expr: {}}}: {e}",
+                        self.publisher.key_expr()
+                    )
+                })?;
                 let chunks = bytes.chunks(size);
-                let frag_count = chunks.len();
                 let mut fragments = vec![];
                 let mut builders = vec![];
                 for (i, chunk) in chunks.enumerate() {
@@ -849,7 +866,7 @@ impl Wait for AdvancedPublisherPutBuilder<'_> {
                         .builder
                         .clone()
                         .payload(chunk)
-                        .frag_info(FragInfo::new(frag_count as u32, i as u32));
+                        .frag_info(FragInfo::new(frag_count, i as u32));
                     match i {
                         0 => {
                             // fragment 0 carries timestamp and attachment of original message

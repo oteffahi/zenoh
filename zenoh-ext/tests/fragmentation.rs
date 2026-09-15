@@ -264,3 +264,40 @@ async fn test_orphan_fragment_dropped() {
 
     assert!(sub.try_recv().unwrap().is_none());
 }
+
+// Fragments beyond a subscriber's cap (`max_fragments`, default 4096) are
+// enforced on the subscriber side and are rejected on arrival: the
+// publication succeeds on the publisher side, and no sample is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_subscriber_drops_fragments_beyond_cap() {
+    zenoh_util::init_log_from_env_or("error");
+    let (peer1, peer2) = create_peer_pair().await;
+
+    let sub = ztimeout!(peer2
+        .declare_subscriber("test/fragmentation/refuse")
+        .advanced())
+    .unwrap();
+    tokio::time::sleep(SLEEP).await;
+
+    let publ = ztimeout!(peer1
+        .declare_publisher("test/fragmentation/refuse")
+        .advanced()
+        .fragmentation(1)
+        .sample_miss_detection(MissDetectionConfig::default()))
+    .unwrap();
+
+    // 4097 bytes with fragmentation(1) -> 4097 fragments > default cap.
+    ztimeout!(publ.put("A".repeat(4097))).unwrap();
+    tokio::time::sleep(SLEEP).await;
+    assert!(
+        sub.try_recv().unwrap().is_none(),
+        "fragments beyond the subscriber's cap must not be delivered"
+    );
+
+    // The publisher stays usable: an in-bounds publication is delivered.
+    ztimeout!(publ.put("ok")).unwrap();
+    tokio::time::sleep(SLEEP).await;
+    let sample = ztimeout!(sub.recv_async()).unwrap();
+    assert_eq!(sample.payload().try_to_string().unwrap().as_ref(), "ok");
+    assert!(sub.try_recv().unwrap().is_none());
+}
