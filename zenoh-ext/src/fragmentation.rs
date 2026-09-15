@@ -44,6 +44,12 @@ pub(crate) enum FragmentedSample {
     Single(Sample),
     Partial {
         frag_count: u32,
+        // TODO: `from_first_fragment` eagerly allocates `vec![None; frag_count]`
+        //       (~600 KB per slot at the 4096-fragment cap, scaled by `max_history_depth`),
+        //       allowing a payload-less attacker to inflate memory by declaring
+        //       a large `frag_count` on each first fragment.
+        //       A sparse `BTreeMap<u32, Sample>`, or deferring allocation until
+        //       a non-first fragment arrives, should be considered.
         frags: Vec<Option<Sample>>,
     },
 }
