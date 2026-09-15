@@ -242,6 +242,15 @@ impl<P, T> SampleBuilderTrait for PublicationBuilder<P, T> {
 #[zenoh_macros::internal_trait]
 #[cfg(feature = "unstable")]
 impl<P, T> FragInfoBuilderTrait for PublicationBuilder<P, T> {
+    /// Attach fragmentation information.
+    ///
+    /// This is an internal API intended for use by
+    /// [`AdvancedPublisher`](https://docs.rs/zenoh-ext) — see the
+    /// `FragInfoBuilderTrait` documentation for details. Manually setting `frag_info`
+    /// on a publication without [`SourceInfo`](crate::sample::SourceInfo)
+    /// is unsupported: such fragments are discarded by
+    /// [`AdvancedSubscriber`](https://docs.rs/zenoh-ext) and never
+    /// reassembled.
     #[zenoh_macros::unstable]
     fn frag_info<TF: Into<Option<FragInfo>>>(self, frag_info: TF) -> Self {
         Self {

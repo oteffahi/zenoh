@@ -386,7 +386,7 @@ impl<'a, 'c, Handler, const BACKGROUND: bool>
 
     /// Set the maximum number of fragments a single sample may carry.
     ///
-    /// Fragments advertised with a [`FragInfo::frag_count`](crate::sample::FragInfo::frag_count)
+    /// Fragments advertised with a [`FragInfo::frag_count`](zenoh::sample::FragInfo::frag_count)
     /// larger than this value are rejected.
     ///
     /// Resolving a builder with `max` set to zero will fail.
@@ -882,11 +882,31 @@ fn deliver_and_flush(
     }
 }
 
+/// A fragmented sample must carry `SourceInfo`: it is only produced by
+/// [`AdvancedPublisher`](crate::AdvancedPublisher) with
+/// [`sample_miss_detection`](crate::MissDetectionConfig) enabled, and the
+/// reassembly below keys partial slots by `(source_id, sequence number)`.
+/// See [`FragInfoBuilderTrait`].
+#[inline]
+fn is_orphan_fragment(sample: &Sample) -> bool {
+    // TODO: update when timestamped sources are supported on fragmentation
+    sample.source_info().is_none() && sample.frag_info().is_some()
+}
+
 #[zenoh_macros::unstable]
 fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
     let Some(callback) = states.callback.as_ref() else {
         return (false, false);
     };
+    if is_orphan_fragment(&sample) {
+        tracing::debug!(
+            "AdvancedSubscriber: dropped fragmented sample without source_info: \
+             fragmentation information is meaningless without sequence-number \
+             source_info. Fragments must originate from an AdvancedPublisher \
+             with sample_miss_detection enabled."
+        );
+        return (false, false);
+    }
     if let Some(source_info) = sample.source_info().cloned() {
         let mut new_source = false;
         let source_id = *source_info.source_id();
@@ -3113,6 +3133,82 @@ mod tests {
         }
 
         drop((sub, publ));
+        let _ = ztimeout!(session.close());
+    }
+
+    /// A fragmented sample without `source_info` cannot be reassembled: it
+    /// must be dropped, with no state created and nothing delivered. A
+    /// control sample with `source_info` must be accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_orphan_fragment_dropped() {
+        zenoh_util::init_log_from_env_or("error");
+        let session = ztimeout!(zenoh::open(Config::default())).unwrap();
+
+        let key_expr = KeyExpr::try_from("test/ext/frag/orphan").unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let received_cb = received.clone();
+        let statesref = Arc::new_cyclic(|weak| {
+            Mutex::new(State {
+                next_id: 0,
+                global_pending_queries: 0,
+                sequenced_states: LruCache::unbounded(),
+                timestamped_states: LruCache::unbounded(),
+                session: session.downgrade(),
+                key_expr: key_expr.clone().into_owned(),
+                retransmission: false,
+                period: None,
+                max_history_depth: 10,
+                query_target: QueryTarget::All,
+                query_timeout: Duration::from_secs(10),
+                max_fragments: MAX_FRAGMENTS_DEFAULT,
+                callback: Some(Callback::from(move |s: Sample| {
+                    received_cb.lock().unwrap().push(s);
+                })),
+                miss_handlers: HashMap::new(),
+                token: None,
+                _gc_task: AbortOnDropHandle::new(
+                    ZRuntime::Application.spawn(gc_task(weak.clone(), Duration::from_secs(3600))),
+                ),
+            })
+        });
+
+        // Orphan fragment: `frag_info` set, no `source_info`, no timestamp.
+        let orphan: Sample = SampleBuilder::put(key_expr.clone(), "4567")
+            .frag_info(FragInfo::new(3, 1))
+            .into();
+        {
+            let mut states = zlock!(statesref);
+            let (_, new_frag) = handle_sample(&mut states, orphan);
+            assert!(!new_frag);
+            assert!(
+                states.sequenced_states.is_empty() && states.timestamped_states.is_empty(),
+                "no state must be created for an orphan fragment"
+            );
+        }
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "orphan fragment must not be delivered"
+        );
+
+        // Control: the same fragment with `source_info` is accepted.
+        let publ = session
+            .declare_publisher("test/ext/frag/orphan/pub")
+            .wait()
+            .unwrap();
+        let source_id = publ.id();
+        let sequenced: Sample = SampleBuilder::put(key_expr.clone(), "4567")
+            .frag_info(FragInfo::new(3, 1))
+            .source_info(SourceInfo::new(source_id, 0))
+            .into();
+        {
+            let mut states = zlock!(statesref);
+            let (_, new_frag) = handle_sample(&mut states, sequenced);
+            assert!(new_frag);
+            let state = states.sequenced_states.get_mut(&source_id).unwrap();
+            assert_eq!(state.pending_samples.len(), 1);
+        }
+
+        drop(statesref);
         let _ = ztimeout!(session.close());
     }
 }

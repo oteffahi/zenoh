@@ -780,6 +780,16 @@ impl<P> SampleBuilderTrait for AdvancedPublicationBuilder<'_, P> {
 
 #[zenoh_macros::unstable]
 impl<P> FragInfoBuilderTrait for AdvancedPublicationBuilder<'_, P> {
+    /// Attach fragmentation information.
+    ///
+    /// Even though [`AdvancedPublisher`] handles fragmentation itself via
+    /// [`fragmentation`](AdvancedPublisherBuilder::fragmentation) — which
+    /// sets `frag_info` (and `SourceInfo`) on every fragment — manually
+    /// setting `frag_info` on an advanced publication is allowed. Note
+    /// that [`AdvancedSubscriber`](crate::AdvancedSubscriber) discards fragmented samples without
+    /// [`SourceInfo`], so `source_info` must be set (or
+    /// [`sample_miss_detection`](crate::MissDetectionConfig) enabled on
+    /// the publisher) for fragments to be reassembled.
     #[zenoh_macros::unstable]
     fn frag_info<TF: Into<Option<FragInfo>>>(self, frag_info: TF) -> Self {
         Self {

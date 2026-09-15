@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use zenoh::{internal::ztimeout, Config};
+use zenoh::{internal::ztimeout, sample::FragInfo, Config};
 use zenoh_config::{EndPoint, EndPoints, WhatAmI};
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, MissDetectionConfig,
@@ -239,4 +239,28 @@ async fn test_no_recovery_query_on_in_order_fragmentation() {
         0,
         "recovery queries were emitted for in-order fragmented publications"
     );
+}
+
+// Fragmented samples manually published without `source_info` cannot be
+// reassembled by an AdvancedSubscriber and must be dropped: each fragment is
+// discarded on arrival instead of being delivered raw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_orphan_fragment_dropped() {
+    zenoh_util::init_log_from_env_or("error");
+    let (peer1, peer2) = create_peer_pair().await;
+
+    let sub = ztimeout!(peer2
+        .declare_subscriber("test/fragmentation/orphan")
+        .advanced())
+    .unwrap();
+    tokio::time::sleep(SLEEP).await;
+
+    // Regular publisher: no sample_miss_detection, hence no `source_info`.
+    let publ = ztimeout!(peer1.declare_publisher("test/fragmentation/orphan")).unwrap();
+
+    ztimeout!(publ.put("frag0").frag_info(FragInfo::new(2, 0))).unwrap();
+    ztimeout!(publ.put("frag1").frag_info(FragInfo::new(2, 1))).unwrap();
+    tokio::time::sleep(SLEEP).await;
+
+    assert!(sub.try_recv().unwrap().is_none());
 }

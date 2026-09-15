@@ -150,6 +150,13 @@ impl<const ID: u8> From<SourceInfo> for zenoh_protocol::zenoh::ext::SourceInfoTy
 }
 
 /// Information on the fragmentation of a zenoh [`Sample`].
+///
+/// This is an internal API intended for use by
+/// [`AdvancedPublisher`](https://docs.rs/zenoh-ext).
+/// [`AdvancedSubscriber`](https://docs.rs/zenoh-ext)
+/// reassembles fragmented samples by keying slots on
+/// [`SourceInfo`]; fragmented samples without `SourceInfo` cannot be
+/// reassembled and are discarded by `AdvancedSubscriber`.
 #[zenoh_macros::unstable]
 #[derive(Debug, Clone)]
 pub struct FragInfo {
