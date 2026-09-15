@@ -1256,6 +1256,21 @@ fn spawn_frag_recovery(
                 if missing.is_empty() {
                     return;
                 }
+                // FIXME: this scan loops forever while any slot
+                // stays incomplete, but some slots can never complete.
+                // If the first fragment of a sample has a `frag_count` that
+                // later fragments disagree with, `FragmentedSample::insert`
+                // rejects them with `CountMismatch` forever, so their ranges
+                // stay "missing": an arbitrarily configured (or malicious)
+                // publisher keeps this task issuing recovery queries each
+                // tick — queries the cache answers, but `insert_fragment`
+                // keeps rejecting. Until the count is fixed on the publisher,
+                // the sample is permanently unassembleable and the churn is
+                // unbounded. Consider giving up on a slot after N failed
+                // recovery rounds (counting rounds per sn since its slot was
+                // created), dropping it from `pending_samples` (optionally
+                // reporting the sample as missed) so the scan can terminate.
+
                 // Pre-increment `pending_queries` by one per `session.get` we
                 // are about to issue, atomically with the missing-ranges
                 // snapshot: if the source state is garbage-collected before

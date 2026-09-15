@@ -150,6 +150,12 @@ impl FragmentedSample {
     /// * `InvalidFragNum` if `frag_num >= frag_count`.
     /// * `InvalidFragCount` if `frag_count == 0`.
     /// * `CountMismatch` if the incoming `frag_count` disagrees with the slot.
+    ///
+    /// # Known limitation
+    /// A slot whose `frag_count` is contradicted by every subsequent fragment
+    /// is locked-until-gone: `CountMismatch` is returned forever. See the
+    /// FIXME in `spawn_frag_recovery` for the resulting unbounded recovery
+    /// query churn.
     pub(crate) fn insert(
         &mut self,
         sample: Sample,
