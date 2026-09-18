@@ -57,7 +57,7 @@ use {
 
 use crate::{
     advanced_cache::{ke_liveliness, KE_UHLC},
-    fragmentation::{FragmentedSample, MAX_FRAGMENTS_DEFAULT},
+    fragmentation::{FragRange, FragmentedSample, MAX_FRAGMENTS_DEFAULT},
     utils::WrappingSn,
     z_deserialize,
 };
@@ -138,9 +138,18 @@ impl<const CONFIGURED: bool> Default for RecoveryConfig<CONFIGURED> {
 impl<const CONFIGURED: bool> RecoveryConfig<CONFIGURED> {
     /// Specify the period of the fragment recovery scan.
     ///
-    /// Missing fragments of an incomplete sample are queried at most this
-    /// delay after the sample went incomplete. Builder will fail if `delay`
-    /// is zero.
+    /// Missing *hole* fragments of an incomplete sample (fragments bounded by
+    /// received fragments on both sides, which sequential arrival can never
+    /// fill — e.g. fragment 2 when fragments 0, 1 and 3 arrived) are queried
+    /// immediately on detection and re-queried by the scan at most this delay
+    /// after they went missing.
+    ///
+    /// The remaining *tail* fragments of an incomplete sample (fragments
+    /// following the highest received one) are only queried once no fragment
+    /// of the sample arrived for this delay: they are normally filled by the
+    /// sequential arrival of the rest of the sample.
+    ///
+    /// Builder will fail if `delay` is zero.
     #[zenoh_macros::unstable]
     #[inline]
     pub fn fragments_recovery_delay(self, delay: Duration) -> RecoveryConfig<CONFIGURED> {
@@ -1070,6 +1079,10 @@ fn range(name: &str, start: Option<WrappingSn>, end: Option<WrappingSn>) -> Stri
     }
 }
 
+/// The missing fragment ranges of several samples, one `session.get` to be
+/// issued per range.
+type MissingFrags = Vec<(WrappingSn, Vec<FragRange>)>;
+
 fn spawn_periodic_queries(
     statesref: &Arc<Mutex<State>>,
     period: Option<Duration>,
@@ -1217,13 +1230,73 @@ fn arm_frag_recovery(
     ));
 }
 
+/// Run fragment recovery for the slot of the fragment that was just inserted
+/// via [`handle_sample`] (must be called with the state lock held, right
+/// after the insertion).
+///
+/// * Arms the recurring fragment-recovery scan when the insertion created a
+///   new sequence-number slot.
+/// * Fires immediate recovery queries for the hole ranges the insertion
+///   opened: an out-of-order fragment (e.g. receiving 0, 1, 3 of 5) opens
+///   holes that sequential arrival can never fill, so they are queried right
+///   away instead of waiting for the next scan tick. Holes already targeted
+///   by a previous immediate query are skipped
+///   ([`FragmentedSample::new_holes`]), and the slot's tail (e.g. fragments
+///   4..) is left to the recurring scan, which only queries it once the
+///   sequential stream looks stalled.
+///
+/// `pending_queries` is pre-incremented by the number of `session.get` to be
+/// issued, atomically with the holes snapshot (see
+/// [`issue_frag_recovery_queries`]).
+fn frag_recovery_on_fragment(
+    statesref: &Arc<Mutex<State>>,
+    key_expr: &KeyExpr<'static>,
+    state: &mut SourceState<WrappingSn>,
+    source_id: EntityGlobalId,
+    sn: WrappingSn,
+    new_frag: bool,
+    delay: Duration,
+) {
+    if new_frag {
+        arm_frag_recovery(statesref, key_expr, state, source_id, delay);
+    }
+    let Some(holes) = state
+        .pending_samples
+        .get_mut(&sn)
+        .map(|fs| fs.new_holes())
+        .filter(|holes| !holes.is_empty())
+    else {
+        return;
+    };
+    // Pre-increment `pending_queries` by one per `session.get` to be issued,
+    // atomically with the holes snapshot (see `issue_frag_recovery_queries`).
+    state.pending_queries = state.pending_queries.saturating_add(holes.len() as u64);
+    let statesref = statesref.clone();
+    let key_expr = key_expr.clone();
+    ZRuntime::Application.spawn(async move {
+        issue_frag_recovery_queries(statesref, key_expr, source_id, delay, vec![(sn, holes)]).await;
+    });
+}
+
 /// Spawn the recurring fragment-recovery scan of a source.
 ///
-/// Every `delay`, the scan snapshots the missing fragment ranges of all
-/// incomplete samples of the source and issues one `session.get` per range,
-/// replies being inserted via [`handle_sample`]. It exits at the first tick
-/// finding nothing incomplete; [`arm_frag_recovery`] re-arms it when a new
-/// fragmented sample arrives.
+/// Every `delay`, the scan snapshots the missing fragments of all incomplete
+/// samples of the source and issues one `session.get` per missing range,
+/// replies being inserted via [`handle_sample`]. Two kinds of ranges are
+/// distinguished:
+/// * *holes* — closed ranges bounded by received fragments on both sides
+///   (e.g. fragment 2 in a sample whose fragments 0, 1 and 3 arrived) — are
+///   always queried: sequential arrival can never fill them. In practice
+///   they are already recovered by the immediate queries fired on detection;
+///   the scan is their safety net (e.g. when the cache was unavailable).
+/// * the *tail* — the open-ended range following the highest received
+///   fragment (e.g. fragments 4.. in a sample whose fragments 0..3 arrived)
+///   — is only queried once no fragment of the sample arrived for `delay`:
+///   it is normally filled by the sequential arrival of the remaining
+///   fragments, and querying it in-flight would be wasted.
+///
+/// The scan exits at the first tick finding no incomplete sample;
+/// [`arm_frag_recovery`] re-arms it when a new fragmented sample arrives.
 ///
 /// `pending_queries` is pre-incremented by the number of `session.get` to be
 /// issued, atomically with the missing-ranges snapshot; each get's
@@ -1241,19 +1314,32 @@ fn spawn_frag_recovery(
         interval.tick().await; // the first tick is immediate: discard it
         loop {
             interval.tick().await;
-            let (session, query_target, query_timeout, missing) = {
+            let missing = {
                 let mut lock = zlock!(statesref);
                 let states = &mut *lock;
                 let Some(state) = states.sequenced_states.get_mut(&source_id) else {
                     return;
                 };
-                let missing: Vec<_> = state
-                    .pending_samples
-                    .iter()
-                    .map(|(sn, frags)| (*sn, frags.missing_ranges()))
-                    .filter(|(_, ranges)| !ranges.is_empty())
-                    .collect();
-                if missing.is_empty() {
+                let now = Instant::now();
+                let mut missing: MissingFrags = Vec::new();
+                for (sn, frags) in state.pending_samples.iter_mut() {
+                    let mut ranges = frags.missing_holes();
+                    // Only query the tail once the sequential stream it is
+                    // expected from looks stalled.
+                    if let Some(tail) = frags.missing_tail() {
+                        if now.duration_since(frags.last_arrival()) >= delay {
+                            ranges.push(tail);
+                        }
+                    }
+                    if !ranges.is_empty() {
+                        missing.push((*sn, ranges));
+                    }
+                }
+                // Exit only once no sample is incomplete anymore, tail
+                // included: a sample whose tail has not been queried yet (its
+                // stream was still active) must keep the scan alive so the
+                // tail is recovered if the stream stalls.
+                if state.pending_samples.values().all(|fs| fs.is_complete()) {
                     return;
                 }
                 // FIXME: this scan loops forever while any slot
@@ -1279,77 +1365,112 @@ fn spawn_frag_recovery(
                 // cannot drift below zero.
                 let nb_gets: u64 = missing.iter().map(|(_, r)| r.len() as u64).sum();
                 state.pending_queries = state.pending_queries.saturating_add(nb_gets);
-                (
-                    states.session.clone(),
-                    states.query_target,
-                    states.query_timeout,
-                    missing,
-                )
+                missing
             };
-            let query_expr = key_expr.clone()
-                / KE_ADV_PREFIX
-                / KE_STAR
-                / &source_id.zid().into_keyexpr()
-                / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
-                / KE_STARSTAR;
-            for (sn, ranges) in missing {
-                let seq_num_range = range("_sn", Some(sn), Some(sn));
-                for missing_range in ranges {
-                    let frags_range = range(
-                        "_fn",
-                        missing_range.0.map(Into::into),
-                        missing_range.1.map(Into::into),
-                    );
-                    let _ = session
-                        .get(Selector::from((
-                            query_expr.clone(),
-                            seq_num_range.clone() + ";" + &frags_range,
-                        )))
-                        .callback({
-                            // Handler is moved into the callback: its `Drop` (and the
-                            // matching `pending_queries` decrement) then
-                            // happens when the query completes.
-                            let handler = SequencedRepliesHandler {
-                                source_id,
-                                statesref: statesref.clone(),
-                            };
-                            let key_expr = key_expr.clone().into_owned();
-                            let statesref = statesref.clone();
-                            move |r: Reply| {
-                                let _handler = &handler;
-                                if let Ok(s) = r.into_result() {
-                                    if key_expr.intersects(s.key_expr()) {
-                                        let states = &mut *zlock!(statesref);
-                                        let source_info = s.source_info().cloned();
-                                        let is_fragmented = s.frag_info().is_some();
-                                        let (_new_source, new_frag) = handle_sample(states, s);
-                                        if new_frag && is_fragmented {
-                                            if let Some(source_id2) =
-                                                source_info.as_ref().map(|si| *si.source_id())
-                                            {
-                                                if let Some(state) =
-                                                    states.sequenced_states.get_mut(&source_id2)
-                                                {
-                                                    arm_frag_recovery(
-                                                        &statesref, &key_expr, state, source_id2,
-                                                        delay,
-                                                    );
-                                                }
-                                            }
+            if missing.is_empty() {
+                continue;
+            }
+            issue_frag_recovery_queries(
+                statesref.clone(),
+                key_expr.clone(),
+                source_id,
+                delay,
+                missing,
+            )
+            .await;
+        }
+    }))
+}
+
+/// Issue one `session.get` per `(sn, missing-range)` pair of `missing`,
+/// replies being inserted via [`handle_sample`].
+///
+/// The caller must have pre-incremented `pending_queries` by one per
+/// `session.get` under the state lock, atomically with the missing-ranges
+/// snapshot: if the source state is garbage-collected before all replies have
+/// arrived, the remaining handler drops are skipped (clamped via
+/// `saturating_sub`), so the counter cannot drift below zero.
+async fn issue_frag_recovery_queries(
+    statesref: Arc<Mutex<State>>,
+    key_expr: KeyExpr<'static>,
+    source_id: EntityGlobalId,
+    delay: Duration,
+    missing: MissingFrags,
+) {
+    let (session, query_target, query_timeout) = {
+        let states = &mut *zlock!(statesref);
+        (
+            states.session.clone(),
+            states.query_target,
+            states.query_timeout,
+        )
+    };
+    let query_expr = key_expr.clone()
+        / KE_ADV_PREFIX
+        / KE_STAR
+        / &source_id.zid().into_keyexpr()
+        / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
+        / KE_STARSTAR;
+    for (sn, ranges) in missing {
+        let seq_num_range = range("_sn", Some(sn), Some(sn));
+        for missing_range in ranges {
+            let frags_range = range(
+                "_fn",
+                missing_range.0.map(Into::into),
+                missing_range.1.map(Into::into),
+            );
+            let _ = session
+                .get(Selector::from((
+                    query_expr.clone(),
+                    seq_num_range.clone() + ";" + &frags_range,
+                )))
+                .callback({
+                    // Handler is moved into the callback: its `Drop` (and the
+                    // matching `pending_queries` decrement) then
+                    // happens when the query completes.
+                    let handler = FragRecoveryRepliesHandler {
+                        source_id,
+                        statesref: statesref.clone(),
+                    };
+                    let key_expr = key_expr.clone().into_owned();
+                    let statesref = statesref.clone();
+                    move |r: Reply| {
+                        let _handler = &handler;
+                        if let Ok(s) = r.into_result() {
+                            if key_expr.intersects(s.key_expr()) {
+                                let states = &mut *zlock!(statesref);
+                                let source_info = s.source_info().cloned();
+                                let is_fragmented = s.frag_info().is_some();
+                                let (_new_source, new_frag) = handle_sample(states, s);
+                                if new_frag && is_fragmented {
+                                    if let Some(source_info) = source_info.as_ref() {
+                                        let source_id2 = *source_info.source_id();
+                                        if let Some(state) =
+                                            states.sequenced_states.get_mut(&source_id2)
+                                        {
+                                            frag_recovery_on_fragment(
+                                                &statesref,
+                                                &key_expr,
+                                                state,
+                                                source_id2,
+                                                source_info.source_sn().into(),
+                                                new_frag,
+                                                delay,
+                                            );
                                         }
                                     }
                                 }
                             }
-                        })
-                        .consolidation(ConsolidationMode::None)
-                        .accept_replies(ReplyKeyExpr::Any)
-                        .target(query_target)
-                        .timeout(query_timeout)
-                        .wait();
-                }
-            }
+                        }
+                    }
+                })
+                .consolidation(ConsolidationMode::None)
+                .accept_replies(ReplyKeyExpr::Any)
+                .target(query_target)
+                .timeout(query_timeout)
+                .wait();
         }
-    }))
+    }
 }
 
 #[zenoh_macros::unstable]
@@ -1432,15 +1553,18 @@ impl<Handler> AdvancedSubscriber<Handler> {
                 let is_fragmented = s.frag_info().is_some();
                 let (new_source, new_frag) = handle_sample(states, s);
 
-                if new_frag && is_fragmented {
+                if is_fragmented {
                     if let Some(reconf) = retransmission {
-                        if let Some(source_id) = source_info.as_ref().map(|si| *si.source_id()) {
+                        if let Some(source_info) = source_info.as_ref() {
+                            let source_id = *source_info.source_id();
                             if let Some(state) = states.sequenced_states.get_mut(&source_id) {
-                                arm_frag_recovery(
+                                frag_recovery_on_fragment(
                                     &statesref,
                                     &key_expr,
                                     state,
                                     source_id,
+                                    source_info.source_sn().into(),
+                                    new_frag,
                                     reconf.frag_recovery_delay,
                                 );
                             }
@@ -1458,14 +1582,16 @@ impl<Handler> AdvancedSubscriber<Handler> {
                         // in sequence numbers (smallest pending SN !=
                         // last_delivered + 1). An incomplete smallest entry (a
                         // fragmented sample still missing fragments) is not a
-                        // whole-sample recovery condition: it is handled by the
-                        // fragment recovery task (`spawn_frag_recovery`), which
-                        // waits `frag_recovery_delay` before issuing targeted
-                        // `_fn`-range queries and sends nothing under no-loss
-                        // conditions. Likewise, while `last_delivered` is `None`
-                        // no baseline has been established yet (e.g. the first
-                        // sample of a source is still being assembled), so no gap
-                        // can be detected.
+                        // whole-sample recovery condition: holes are recovered
+                        // immediately by `frag_recovery_on_fragment`, and its
+                        // tail is handled by the fragment recovery task
+                        // (`spawn_frag_recovery`), which issues targeted
+                        // `_fn`-range queries only once the sequential stream
+                        // delivering the sample looks stalled, sending nothing
+                        // under no-loss conditions. Likewise, while
+                        // `last_delivered` is `None` no baseline has been
+                        // established yet (e.g. the first sample of a source is
+                        // still being assembled), so no gap can be detected.
                         let needs_recovery = state.last_delivered.is_some()
                             && !state.pending_samples.is_empty()
                             && state.pending_samples.keys().next().copied()
@@ -2175,6 +2301,31 @@ impl Drop for SequencedRepliesHandler {
     }
 }
 
+/// Reply handler for fragment-recovery queries.
+///
+/// Decrements `pending_queries` when the query completes, without flushing
+/// the source. Unlike [`SequencedRepliesHandler`], a recovery round that did
+/// not complete a sample must not discard it: the recurring scan keeps
+/// retrying its missing ranges, and further fragments may still arrive for
+/// it.
+#[zenoh_macros::unstable]
+#[derive(Clone)]
+struct FragRecoveryRepliesHandler {
+    source_id: EntityGlobalId,
+    statesref: Arc<Mutex<State>>,
+}
+
+#[zenoh_macros::unstable]
+impl Drop for FragRecoveryRepliesHandler {
+    fn drop(&mut self) {
+        let states = &mut *zlock!(self.statesref);
+        // use peek_mut so query without samples do not prevent the state to be garbage collected
+        if let Some(state) = states.sequenced_states.peek_mut(&self.source_id) {
+            state.pending_queries = state.pending_queries.saturating_sub(1);
+        }
+    }
+}
+
 #[zenoh_macros::unstable]
 #[derive(Clone)]
 struct TimestampedRepliesHandler {
@@ -2802,6 +2953,306 @@ mod tests {
                 queries.iter().filter(|q| q.contains("_sn=1..1")).count() >= 2,
                 "SN 1 missing ranges must be queried: {queries:?}"
             );
+        }
+
+        let _ = ztimeout!(session.close());
+    }
+
+    /// Build a reassembly state with recovery enabled, collecting deliveries.
+    fn frag_recovery_state(
+        session: &Session,
+        key_expr: &KeyExpr<'static>,
+        received: Arc<Mutex<Vec<Sample>>>,
+    ) -> Arc<Mutex<State>> {
+        Arc::new(Mutex::new(State {
+            next_id: 0,
+            global_pending_queries: 0,
+            sequenced_states: LruCache::unbounded(),
+            timestamped_states: LruCache::unbounded(),
+            session: session.downgrade(),
+            key_expr: key_expr.clone().into_owned(),
+            retransmission: true,
+            period: None,
+            max_history_depth: 10,
+            query_target: QueryTarget::All,
+            query_timeout: Duration::from_secs(10),
+            max_fragments: MAX_FRAGMENTS_DEFAULT,
+            callback: Some(Callback::from(move |s: Sample| {
+                received.lock().unwrap().push(s);
+            })),
+            miss_handlers: HashMap::new(),
+            token: None,
+            _gc_task: AbortOnDropHandle::new(ZRuntime::Application.spawn(std::future::pending())),
+        }))
+    }
+
+    /// Insert a fragment and run fragment recovery like the live callback
+    /// does (`handle_sample` + `frag_recovery_on_fragment`).
+    #[allow(clippy::too_many_arguments)]
+    fn feed_fragment(
+        statesref: &Arc<Mutex<State>>,
+        key_expr: &KeyExpr<'static>,
+        source_id: EntityGlobalId,
+        payload: &str,
+        frag_count: u32,
+        frag_num: u32,
+        sn: u32,
+        delay: Duration,
+    ) {
+        let frag: Sample = SampleBuilder::put(key_expr.clone(), payload)
+            .frag_info(FragInfo::new(frag_count, frag_num))
+            .source_info(SourceInfo::new(source_id, sn))
+            .into();
+        let mut states = zlock!(statesref);
+        let source_info = frag.source_info().cloned();
+        let is_fragmented = frag.frag_info().is_some();
+        let (_new_source, new_frag) = handle_sample(&mut states, frag);
+        if is_fragmented {
+            if let Some(source_info) = source_info.as_ref() {
+                let source_id = *source_info.source_id();
+                if let Some(state) = states.sequenced_states.get_mut(&source_id) {
+                    frag_recovery_on_fragment(
+                        statesref,
+                        key_expr,
+                        state,
+                        source_id,
+                        source_info.source_sn().into(),
+                        new_frag,
+                        delay,
+                    );
+                }
+            }
+        }
+    }
+
+    /// A hole opened by an out-of-order fragment (e.g. receiving 0, 1, 3 of
+    /// 5) must be queried immediately, well before the first recovery scan
+    /// tick, and must not be re-queried immediately by every subsequent
+    /// fragment arrival.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_fragment_recovery_immediate_hole_query() {
+        zenoh_util::init_log_from_env_or("error");
+        const DELAY: Duration = Duration::from_millis(300);
+
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.set_mode(Some(WhatAmI::Peer)).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+
+        // Records query selectors; replies an error so `session.get` (target
+        // `All`) completes immediately instead of at `query_timeout`.
+        let spy_queries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let _spy = {
+            let spy_queries = spy_queries.clone();
+            ztimeout!(session
+                .declare_queryable("test/ext/frag/hole/@adv/**")
+                .callback(move |q: Query| {
+                    spy_queries.lock().unwrap().push(q.selector().to_string());
+                    let _ = q.reply_err(ZBytes::new()).wait();
+                }))
+            .unwrap()
+        };
+
+        let publ = ztimeout!(session
+            .declare_publisher("test/ext/frag/hole")
+            .advanced()
+            .fragmentation(4)
+            .cache(crate::CacheConfig::default().max_samples(10))
+            .sample_miss_detection(crate::MissDetectionConfig::default()))
+        .unwrap();
+        let source_id = publ.id();
+
+        let key_expr: KeyExpr<'static> = KeyExpr::try_from("test/ext/frag/hole").unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let statesref = frag_recovery_state(&session, &key_expr, received.clone());
+
+        // Sequential prefix 0, 1 of 5: no hole, only an active tail. No query
+        // must be fired at all.
+        feed_fragment(&statesref, &key_expr, source_id, "0123", 5, 0, 0, DELAY);
+        feed_fragment(&statesref, &key_expr, source_id, "4567", 5, 1, 0, DELAY);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            spy_queries.lock().unwrap().is_empty(),
+            "sequential fragments must not trigger recovery queries: {:?}",
+            spy_queries.lock().unwrap()
+        );
+
+        // Fragment 3 arrives out of order: hole (2, 2) opens and must be
+        // queried immediately (the first scan tick is only at ~300ms).
+        feed_fragment(&statesref, &key_expr, source_id, "CDEF", 5, 3, 0, DELAY);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let queries = spy_queries.lock().unwrap();
+            let hole_queries = queries.iter().filter(|q| q.contains("_fn=2..2")).count();
+            assert_eq!(
+                hole_queries, 1,
+                "exactly one immediate query for the new hole expected: {queries:?}"
+            );
+            assert!(
+                queries.iter().all(|q| q.contains("_sn=0..0")),
+                "only SN 0 must be queried: {queries:?}"
+            );
+        }
+
+        // Fragment 4 arrives: the hole (2, 2) is unchanged and already
+        // recorded, so no additional immediate query (the scan only ticks at
+        // ~300ms).
+        feed_fragment(&statesref, &key_expr, source_id, "GHIJ", 5, 4, 0, DELAY);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let queries = spy_queries.lock().unwrap();
+            let hole_queries = queries.iter().filter(|q| q.contains("_fn=2..2")).count();
+            assert_eq!(
+                hole_queries, 1,
+                "a recorded hole must not be re-queried immediately: {queries:?}"
+            );
+        }
+
+        // The recurring scan eventually re-queries the hole as a safety net.
+        tokio::time::sleep(DELAY + Duration::from_millis(100)).await;
+        {
+            let queries = spy_queries.lock().unwrap();
+            assert!(
+                queries.iter().filter(|q| q.contains("_fn=2..2")).count() >= 2,
+                "the scan must re-query the hole as a safety net: {queries:?}"
+            );
+        }
+
+        // Feed the missing fragment: the sample completes, is delivered and
+        // the scan is aborted — no task is left ticking.
+        feed_fragment(&statesref, &key_expr, source_id, "89AB", 5, 2, 0, DELAY);
+        let mut delivered = None;
+        for _ in 0..50 {
+            let first = {
+                let received = received.lock().unwrap();
+                received
+                    .first()
+                    .map(|s| s.payload().try_to_string().unwrap().to_string())
+            };
+            if let Some(s) = first {
+                delivered = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(delivered.as_deref(), Some("0123456789ABCDEFGHIJ"));
+        {
+            let mut states = zlock!(statesref);
+            let state = states.sequenced_states.get(&source_id).unwrap();
+            assert!(state.pending_samples.is_empty());
+            assert!(state.frag_recovery_task.is_none());
+        }
+
+        let _ = ztimeout!(session.close());
+    }
+
+    /// The tail of a sample (fragments following the highest received one)
+    /// must not be queried while the sequential stream delivering it is
+    /// active; it must be queried once the stream stalls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_fragment_recovery_tail_queried_when_stalled() {
+        zenoh_util::init_log_from_env_or("error");
+        const DELAY: Duration = Duration::from_millis(300);
+
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.set_mode(Some(WhatAmI::Peer)).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+
+        // Records query selectors; replies an error so `session.get` (target
+        // `All`) completes immediately instead of at `query_timeout`.
+        let spy_queries = Arc::new(Mutex::new(Vec::<String>::new()));
+        let _spy = {
+            let spy_queries = spy_queries.clone();
+            ztimeout!(session
+                .declare_queryable("test/ext/frag/tail/@adv/**")
+                .callback(move |q: Query| {
+                    spy_queries.lock().unwrap().push(q.selector().to_string());
+                    let _ = q.reply_err(ZBytes::new()).wait();
+                }))
+            .unwrap()
+        };
+
+        let publ = ztimeout!(session
+            .declare_publisher("test/ext/frag/tail")
+            .advanced()
+            .fragmentation(4)
+            .cache(crate::CacheConfig::default().max_samples(10))
+            .sample_miss_detection(crate::MissDetectionConfig::default()))
+        .unwrap();
+        let source_id = publ.id();
+
+        let key_expr: KeyExpr<'static> = KeyExpr::try_from("test/ext/frag/tail").unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let statesref = frag_recovery_state(&session, &key_expr, received.clone());
+
+        // Sequential prefix 0, 1 of 4: only the (active) tail (2, ..) is
+        // missing. No query must be fired while the stream looks active.
+        feed_fragment(&statesref, &key_expr, source_id, "0123", 4, 0, 0, DELAY);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        feed_fragment(&statesref, &key_expr, source_id, "4567", 4, 1, 0, DELAY);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            spy_queries.lock().unwrap().is_empty(),
+            "an active sequential stream must not trigger recovery queries: {:?}",
+            spy_queries.lock().unwrap()
+        );
+
+        // The first scan tick (~300ms after arming) sees the stream as
+        // recently active (fragment 1 arrived ~200ms before it) and must
+        // still not query the tail.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            spy_queries.lock().unwrap().is_empty(),
+            "the tail must not be queried while the stream looks active: {:?}",
+            spy_queries.lock().unwrap()
+        );
+
+        // The stream stalls: the tail must eventually be queried.
+        let mut tail_queried = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let queries = spy_queries.lock().unwrap();
+            // Tail `_fn=2..` (open-ended): contains `_fn=2..` but is not a
+            // closed hole `_fn=2..2`.
+            if queries
+                .iter()
+                .any(|q| q.contains("_fn=2..") && !q.contains("_fn=2..2"))
+            {
+                tail_queried = true;
+                break;
+            }
+        }
+        assert!(
+            tail_queried,
+            "stalled tail must be queried: {:?}",
+            spy_queries.lock().unwrap()
+        );
+
+        // Feed the remaining fragments: the sample completes, is delivered
+        // and the scan is aborted — no task is left ticking.
+        feed_fragment(&statesref, &key_expr, source_id, "89AB", 4, 2, 0, DELAY);
+        feed_fragment(&statesref, &key_expr, source_id, "CDEF", 4, 3, 0, DELAY);
+        let mut delivered = None;
+        for _ in 0..50 {
+            let first = {
+                let received = received.lock().unwrap();
+                received
+                    .first()
+                    .map(|s| s.payload().try_to_string().unwrap().to_string())
+            };
+            if let Some(s) = first {
+                delivered = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(delivered.as_deref(), Some("0123456789ABCDEF"));
+        {
+            let mut states = zlock!(statesref);
+            let state = states.sequenced_states.get(&source_id).unwrap();
+            assert!(state.pending_samples.is_empty());
+            assert!(state.frag_recovery_task.is_none());
         }
 
         let _ = ztimeout!(session.close());
