@@ -11,7 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use std::time::{Duration, Instant};
+
 use zenoh::{bytes::ZBytes, internal::zerror, sample::Sample, Result as ZResult};
+
+use crate::utils::WrappingSn;
 
 /// Per-source DoS cap on the number of fragments a single sample may carry.
 ///
@@ -39,6 +43,14 @@ pub(crate) fn fragment_count(payload_len: usize, size: usize) -> ZResult<u32> {
     })
 }
 
+/// A missing fragment range: `(start, end)` fragment-number bounds, the end
+/// being `None` for the open-ended tail of a sample.
+pub(crate) type FragRange = (Option<u32>, Option<u32>);
+
+/// The missing fragment ranges of several samples, one `session.get` to be
+/// issued per range.
+pub(crate) type MissingFrags = Vec<(WrappingSn, Vec<FragRange>)>;
+
 #[derive(Debug, Clone)]
 pub(crate) enum FragmentedSample {
     Single(Sample),
@@ -51,6 +63,15 @@ pub(crate) enum FragmentedSample {
         //       A sparse `BTreeMap<u32, Sample>`, or deferring allocation until
         //       a non-first fragment arrives, should be considered.
         frags: Vec<Option<Sample>>,
+        /// Instant of the most recently accepted fragment: the fragment
+        /// recovery scan uses it to detect a stalled sequential stream before
+        /// querying the trailing (open-ended) missing range.
+        last_arrival: Instant,
+        /// Missing hole ranges already targeted by an immediate recovery
+        /// query, used to avoid re-firing a query on every fragment arrival
+        /// while a hole persists. The recurring recovery scan ignores this
+        /// and re-queries all holes each tick as a safety net.
+        queried_holes: Vec<(u32, u32)>,
     },
 }
 
@@ -76,11 +97,15 @@ impl FragmentedSample {
             0 => Self::Partial {
                 frag_count: 0,
                 frags: Vec::new(),
+                last_arrival: Instant::now(),
+                queried_holes: Vec::new(),
             },
             1 => Self::Single(fragments.into_iter().next().unwrap()),
             n => Self::Partial {
                 frag_count: n as u32,
                 frags: fragments.into_iter().map(Some).collect(),
+                last_arrival: Instant::now(),
+                queried_holes: Vec::new(),
             },
         }
     }
@@ -112,7 +137,12 @@ impl FragmentedSample {
         }
         let mut frags = vec![None; frag_count as usize];
         frags[frag_num as usize] = Some(sample);
-        Ok(Self::Partial { frag_count, frags })
+        Ok(Self::Partial {
+            frag_count,
+            frags,
+            last_arrival: Instant::now(),
+            queried_holes: Vec::new(),
+        })
     }
 
     #[inline]
@@ -141,11 +171,77 @@ impl FragmentedSample {
 
     /// Return the ranges of missing fragment numbers.
     /// For a complete or single-fragment sample the result is empty.
-    pub(crate) fn missing_ranges(&self) -> Vec<(Option<u32>, Option<u32>)> {
+    pub(crate) fn missing_ranges(&self) -> Vec<FragRange> {
         match self {
             Self::Single(_) => Vec::new(),
             Self::Partial { frags, .. } => missing_ranges_impl(frags),
         }
+    }
+
+    /// Return the closed ranges of missing fragment numbers ("holes": ranges
+    /// with known missing fragments both before and after them, e.g. fragment
+    /// 2 in a sample whose fragments 0, 1 and 3 arrived). Sequential arrival
+    /// can never fill a hole, so holes are always recoverable via queries.
+    /// For a complete or single-fragment sample the result is empty.
+    pub(crate) fn missing_holes(&self) -> Vec<FragRange> {
+        self.missing_ranges()
+            .into_iter()
+            .filter(|r| r.1.is_some())
+            .collect()
+    }
+
+    /// Open-ended trailing range of missing fragment numbers (the "tail":
+    /// fragments following the highest contiguous received fragment), returned
+    /// only once no fragment of the sample arrived for `delay` — i.e. the
+    /// sequential stream that fills it looks stalled. `None` otherwise.
+    pub(crate) fn missing_tail(&self, paralysis: Duration) -> Option<FragRange> {
+        match self {
+            Self::Single(_) => None,
+            Self::Partial {
+                frags,
+                last_arrival,
+                ..
+            } => {
+                if last_arrival.elapsed() < paralysis {
+                    return None;
+                }
+                missing_ranges_impl(frags)
+                    .into_iter()
+                    .find(|r| r.1.is_none())
+            }
+        }
+    }
+
+    /// Return the current missing hole ranges not already covered by
+    /// `queried_holes`, and record them there: the caller fires one immediate
+    /// recovery query per returned range. A subsequent call — e.g. after the
+    /// next fragment arrival — only returns *newly opened* or *reshaped*
+    /// holes, preventing redundant queries while a hole persists. `insert`
+    /// prunes `queried_holes` as fragments fill them, so a hole that shrinks
+    /// (e.g. `0..1, 3..4` collapsing to `1..1`) is re-queried for its new
+    /// bounds.
+    pub(crate) fn new_holes(&mut self) -> Vec<FragRange> {
+        let Self::Partial {
+            frags,
+            queried_holes,
+            ..
+        } = self
+        else {
+            return Vec::new();
+        };
+        let mut new = Vec::new();
+        for r in missing_ranges_impl(frags) {
+            if r.1.is_none()
+                || queried_holes
+                    .iter()
+                    .any(|&(s, e)| r.0.unwrap() >= s && r.1.unwrap() <= e)
+            {
+                continue;
+            }
+            queried_holes.push((r.0.unwrap(), r.1.unwrap()));
+            new.push(r);
+        }
+        new
     }
 
     /// Insert a fragment into this slot.
@@ -194,6 +290,8 @@ impl FragmentedSample {
             Self::Partial {
                 frag_count: existing,
                 frags,
+                last_arrival,
+                queried_holes,
             } => {
                 if *existing != frag_count {
                     return Err(FragInsertError::CountMismatch {
@@ -202,6 +300,10 @@ impl FragmentedSample {
                     });
                 }
                 frags[frag_num as usize] = Some(sample);
+                *last_arrival = Instant::now();
+                // Filling fragments shrinks holes: prune covered ranges so a
+                // hole that shrinks (or disappears) can be re-queried.
+                queried_holes.retain(|&(s, e)| s > frag_num || e < frag_num);
                 Ok(())
             }
         }
@@ -249,8 +351,8 @@ impl<'a> Iterator for FragsIter<'a> {
     }
 }
 
-fn missing_ranges_impl(frags: &[Option<Sample>]) -> Vec<(Option<u32>, Option<u32>)> {
-    let mut missing_ranges: Vec<(Option<u32>, Option<u32>)> = vec![];
+fn missing_ranges_impl(frags: &[Option<Sample>]) -> Vec<FragRange> {
+    let mut missing_ranges: Vec<FragRange> = vec![];
     for (i, frag) in frags.iter().enumerate() {
         if missing_ranges.is_empty() {
             if frag.is_none() {
@@ -274,12 +376,16 @@ fn missing_ranges_impl(frags: &[Option<Sample>]) -> Vec<(Option<u32>, Option<u32
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use zenoh::{
         key_expr::KeyExpr,
         sample::{FragInfo, Sample, SampleBuilder},
     };
 
     use super::{fragment_count, FragInsertError, FragmentedSample, MAX_FRAGMENTS_DEFAULT};
+
+    const ZERO: Duration = Duration::ZERO;
 
     fn make_sample(payload: &str, frag_num: u32, frag_count: u32) -> Sample {
         SampleBuilder::put(KeyExpr::try_from("test/key").unwrap(), payload)
@@ -390,6 +496,81 @@ mod tests {
         fs.insert(s4, 4, 5).unwrap();
         let ranges = fs.missing_ranges();
         assert_eq!(ranges, vec![(Some(1), Some(1)), (Some(3), Some(3))]);
+
+        // Holes are the closed ranges, the tail is the open-ended one.
+        assert_eq!(
+            fs.missing_holes(),
+            vec![(Some(1), Some(1)), (Some(3), Some(3))]
+        );
+        assert_eq!(fs.missing_tail(ZERO), None);
+    }
+
+    #[test]
+    fn missing_holes_and_tail() {
+        // Fragments 0, 1 and 3 of 5 received: hole at 2, tail at 4.
+        let s0 = make_sample("A", 0, 5);
+        let s1 = make_sample("B", 1, 5);
+        let s3 = make_sample("D", 3, 5);
+        let mut fs =
+            FragmentedSample::from_first_fragment(s0, 0, 5, MAX_FRAGMENTS_DEFAULT).unwrap();
+        fs.insert(s1, 1, 5).unwrap();
+        fs.insert(s3, 3, 5).unwrap();
+        assert_eq!(fs.missing_holes(), vec![(Some(2), Some(2))]);
+        assert_eq!(fs.missing_tail(ZERO), Some((Some(4), None)));
+        // A fresh arrival gates the tail: `missing_tail` reports nothing until
+        // no fragment arrived for the whole delay.
+        assert_eq!(fs.missing_tail(Duration::from_secs(3600)), None);
+    }
+
+    #[test]
+    fn new_holes_dedup_and_reshape() {
+        // Fragments 0 and 2 of 5 received: hole (1, 1).
+        let s0 = make_sample("A", 0, 5);
+        let s2 = make_sample("C", 2, 5);
+        let mut fs =
+            FragmentedSample::from_first_fragment(s0, 0, 5, MAX_FRAGMENTS_DEFAULT).unwrap();
+        fs.insert(s2, 2, 5).unwrap();
+        // First call reports the hole and records it.
+        assert_eq!(fs.new_holes(), vec![(Some(1), Some(1))]);
+        // Second call reports nothing while the hole persists.
+        assert!(fs.new_holes().is_empty());
+        // Fragment 3 arrives, reshaping the hole to (1, 1) still — but the
+        // recorded range still covers it, so nothing new.
+        fs.insert(make_sample("D", 3, 5), 3, 5).unwrap();
+        assert!(fs.new_holes().is_empty());
+        // Fragment 4 arrives (completing the tail): the hole is unchanged.
+        fs.insert(make_sample("E", 4, 5), 4, 5).unwrap();
+        assert!(fs.new_holes().is_empty());
+        // Fragment 1 arrives, filling the hole.
+        fs.insert(make_sample("B", 1, 5), 1, 5).unwrap();
+        assert!(fs.missing_holes().is_empty());
+        // Hole (2, 3) opens: it must be reported.
+        let s5 = make_sample("F", 0, 6);
+        let mut fs2 =
+            FragmentedSample::from_first_fragment(s5, 0, 6, MAX_FRAGMENTS_DEFAULT).unwrap();
+        fs2.insert(make_sample("G", 1, 6), 1, 6).unwrap();
+        fs2.insert(make_sample("H", 4, 6), 4, 6).unwrap();
+        assert_eq!(fs2.new_holes(), vec![(Some(2), Some(3))]);
+        // Reshaping: fragment 2 arrives, the hole shrinks to (3, 3). The new
+        // bounds are within the recorded (2, 3), but `insert` pruned that
+        // range (it contains fragment 2), so the shrunk hole must be
+        // re-reported.
+        fs2.insert(make_sample("I", 2, 6), 2, 6).unwrap();
+        assert_eq!(fs2.new_holes(), vec![(Some(3), Some(3))]);
+    }
+
+    #[test]
+    fn missing_tail_only() {
+        // Sequential prefix 0, 1, 2 of 5: no hole, tail at 3..
+        let s0 = make_sample("A", 0, 5);
+        let s1 = make_sample("B", 1, 5);
+        let s2 = make_sample("C", 2, 5);
+        let mut fs =
+            FragmentedSample::from_first_fragment(s0, 0, 5, MAX_FRAGMENTS_DEFAULT).unwrap();
+        fs.insert(s1, 1, 5).unwrap();
+        fs.insert(s2, 2, 5).unwrap();
+        assert!(fs.missing_holes().is_empty());
+        assert_eq!(fs.missing_tail(ZERO), Some((Some(3), None)));
     }
 
     #[test]
