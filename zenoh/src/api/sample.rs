@@ -27,6 +27,8 @@ use zenoh_protocol::{
     zenoh::PushBody,
 };
 
+#[cfg(feature = "unstable")]
+use crate::api::timestamp_stack::TimestampStack;
 use crate::api::{
     builders::sample::QoSBuilderTrait, bytes::ZBytes, encoding::Encoding,
     handlers::CallbackParameter, key_expr::KeyExpr, publisher::Priority,
@@ -301,6 +303,8 @@ pub struct SampleFields {
     pub reliability: Reliability,
     #[cfg(feature = "unstable")]
     pub source_info: Option<SourceInfo>,
+    #[cfg(feature = "unstable")]
+    pub timestamp_stack: Option<TimestampStack>,
     pub attachment: Option<ZBytes>,
 }
 
@@ -319,6 +323,8 @@ impl From<Sample> for SampleFields {
             reliability: sample.reliability,
             #[cfg(feature = "unstable")]
             source_info: sample.source_info,
+            #[cfg(feature = "unstable")]
+            timestamp_stack: sample.timestamp_stack,
             attachment: sample.attachment,
         }
     }
@@ -344,6 +350,8 @@ pub struct Sample {
     #[cfg(feature = "unstable")]
     pub(crate) frag_info: Option<FragInfo>,
     pub(crate) attachment: Option<ZBytes>,
+    #[cfg(feature = "unstable")]
+    pub(crate) timestamp_stack: Option<TimestampStack>,
 }
 
 impl Sample {
@@ -428,6 +436,16 @@ impl Sample {
         self.frag_info.as_ref()
     }
 
+    /// Gets the optional timestamp stack attached to this sample.
+    ///
+    /// The timestamp stack carries interception records (Send, Route, Receive)
+    /// collected along the message's path through the network.
+    #[zenoh_macros::unstable]
+    #[inline]
+    pub fn timestamp_stack(&self) -> Option<&TimestampStack> {
+        self.timestamp_stack.as_ref()
+    }
+
     /// Gets the optional sample attachment as bytes.
     #[inline]
     pub fn attachment(&self) -> Option<&ZBytes> {
@@ -457,6 +475,8 @@ impl Sample {
             #[cfg(feature = "unstable")]
             frag_info: None,
             attachment: None,
+            #[cfg(feature = "unstable")]
+            timestamp_stack: None,
         }
     }
 
@@ -465,7 +485,12 @@ impl Sample {
         qos: push::ext::QoSType,
         body: &mut PushBody,
         #[cfg(feature = "unstable")] reliability: Reliability,
+        #[cfg(feature = "unstable")] timestamp_stack: Option<
+            zenoh_protocol::network::timestamp_stack::TimestampStack,
+        >,
     ) -> Self {
+        #[cfg(feature = "unstable")]
+        let timestamp_stack = timestamp_stack.and_then(|ts| TimestampStack::try_from(&ts).ok());
         match body {
             PushBody::Put(put) => Self {
                 key_expr,
@@ -481,6 +506,8 @@ impl Sample {
                 #[cfg(feature = "unstable")]
                 frag_info: put.ext_finfo.map(Into::into),
                 attachment: mem::take(&mut put.ext_attachment).map(Into::into),
+                #[cfg(feature = "unstable")]
+                timestamp_stack,
             },
             PushBody::Del(del) => Self {
                 key_expr,
@@ -496,6 +523,8 @@ impl Sample {
                 #[cfg(feature = "unstable")]
                 frag_info: None,
                 attachment: mem::take(&mut del.ext_attachment).map(Into::into),
+                #[cfg(feature = "unstable")]
+                timestamp_stack,
             },
         }
     }
@@ -508,6 +537,7 @@ impl CallbackParameter for Sample {
         push::ext::QoSType,
         &'a mut PushBody,
         Reliability,
+        Option<zenoh_protocol::network::timestamp_stack::TimestampStack>,
     );
     #[cfg(not(feature = "unstable"))]
     type Message<'a> = (KeyExpr<'static>, push::ext::QoSType, &'a mut PushBody);
@@ -519,6 +549,8 @@ impl CallbackParameter for Sample {
             msg.2,
             #[cfg(feature = "unstable")]
             msg.3,
+            #[cfg(feature = "unstable")]
+            msg.4,
         )
     }
 }

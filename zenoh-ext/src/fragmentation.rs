@@ -52,6 +52,8 @@ pub(crate) type FragRange = (Option<u32>, Option<u32>);
 pub(crate) type MissingFrags = Vec<(WrappingSn, Vec<FragRange>)>;
 
 #[derive(Debug, Clone)]
+// Keep ordinary samples inline to avoid an extra allocation on the unfragmented path.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FragmentedSample {
     Single(Sample),
     Partial {

@@ -19,6 +19,8 @@ use zenoh_protocol::core::CongestionControl;
 #[cfg(feature = "unstable")]
 use zenoh_protocol::core::Reliability;
 
+#[cfg(feature = "unstable")]
+use crate::api::timestamp_stack::{TimestampInstrumentation, TimestampStack};
 use crate::api::{
     bytes::{OptionZBytes, ZBytes},
     encoding::Encoding,
@@ -73,6 +75,18 @@ pub trait SampleBuilderTrait {
 pub trait FragInfoBuilderTrait {
     /// Attach fragmentation information.
     fn frag_info<TF: Into<Option<FragInfo>>>(self, frag_info: TF) -> Self;
+}
+
+pub trait TimestampInstrumentationBuilderTrait {
+    /// Sets the timestamp stack instrumentation to be sent along with the publication.
+    ///
+    /// The timestamp stack carries interception records (Send, Route, Receive)
+    /// collected along the message's path through the network.
+    #[zenoh_macros::unstable]
+    fn timestamp_instrumentation<TS: Into<Option<TimestampInstrumentation>>>(
+        self,
+        instrumentation: TS,
+    ) -> Self;
 }
 
 pub trait EncodingBuilderTrait {
@@ -130,6 +144,8 @@ impl SampleBuilder<SampleBuilderPut> {
                 #[cfg(feature = "unstable")]
                 frag_info: None,
                 attachment: None,
+                #[cfg(feature = "unstable")]
+                timestamp_stack: None,
             },
             _t: PhantomData::<SampleBuilderPut>,
         }
@@ -164,6 +180,8 @@ impl SampleBuilder<SampleBuilderDelete> {
                 #[cfg(feature = "unstable")]
                 frag_info: None,
                 attachment: None,
+                #[cfg(feature = "unstable")]
+                timestamp_stack: None,
             },
             _t: PhantomData::<SampleBuilderDelete>,
         }
@@ -264,6 +282,23 @@ impl<T> FragInfoBuilderTrait for SampleBuilder<T> {
         Self {
             sample: Sample {
                 frag_info: frag_info.into(),
+                ..self.sample
+            },
+            _t: PhantomData::<T>,
+        }
+    }
+}
+
+#[zenoh_macros::internal_trait]
+impl<T> TimestampInstrumentationBuilderTrait for SampleBuilder<T> {
+    #[zenoh_macros::unstable]
+    fn timestamp_instrumentation<TS: Into<Option<TimestampInstrumentation>>>(
+        self,
+        instrumentation: TS,
+    ) -> Self {
+        Self {
+            sample: Sample {
+                timestamp_stack: instrumentation.into().map(TimestampStack::new),
                 ..self.sample
             },
             _t: PhantomData::<T>,
@@ -381,6 +416,8 @@ impl From<&PublicationBuilder<&Publisher<'_>, PublicationBuilderPut>> for Sample
             #[cfg(feature = "unstable")]
             frag_info: builder.frag_info.clone(),
             attachment: builder.attachment.clone(),
+            #[cfg(feature = "unstable")]
+            timestamp_stack: None,
         }
     }
 }
@@ -406,6 +443,8 @@ impl From<&PublicationBuilder<&Publisher<'_>, PublicationBuilderDelete>> for Sam
             #[cfg(feature = "unstable")]
             frag_info: builder.frag_info.clone(),
             attachment: builder.attachment.clone(),
+            #[cfg(feature = "unstable")]
+            timestamp_stack: None,
         }
     }
 }

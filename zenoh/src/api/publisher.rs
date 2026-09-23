@@ -271,6 +271,8 @@ impl<'a> Publisher<'a> {
             #[cfg(feature = "unstable")]
             frag_info: None,
             attachment: None,
+            #[cfg(feature = "unstable")]
+            timestamp_instrumentation: None,
         }
     }
 
@@ -300,6 +302,8 @@ impl<'a> Publisher<'a> {
             #[cfg(feature = "unstable")]
             frag_info: None,
             attachment: None,
+            #[cfg(feature = "unstable")]
+            timestamp_instrumentation: None,
         }
     }
 
@@ -512,6 +516,8 @@ impl Sink<Sample> for Publisher<'_> {
             #[cfg(feature = "unstable")]
             None,
             attachment,
+            #[cfg(feature = "unstable")]
+            None,
         )
     }
 

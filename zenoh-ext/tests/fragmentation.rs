@@ -19,7 +19,12 @@ use std::{
     time::Duration,
 };
 
-use zenoh::{internal::ztimeout, sample::FragInfo, Config};
+use zenoh::{
+    internal::ztimeout,
+    sample::FragInfo,
+    timestamp_stack::{InterceptionPoint, TimestampInstrumentationBuilder},
+    Config, Wait,
+};
 use zenoh_config::{EndPoint, EndPoints, WhatAmI};
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, MissDetectionConfig,
@@ -28,6 +33,78 @@ use zenoh_ext::{
 
 const SLEEP: Duration = Duration::from_secs(1);
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+// The synchronous local delivery path must create recovery timers on Zenoh's
+// runtime, even when the caller has no Tokio runtime.
+#[test]
+fn test_fragmentation_periodic_recovery_without_tokio_runtime() {
+    let mut config = Config::default();
+    config.scouting.multicast.set_enabled(Some(false)).unwrap();
+    config.listen.endpoints.set(vec![]).unwrap();
+    let session = zenoh::open(config).wait().unwrap();
+    let sub = session
+        .declare_subscriber("test/fragmentation/sync")
+        .advanced()
+        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(50)))
+        .wait()
+        .unwrap();
+    let publ = session
+        .declare_publisher("test/fragmentation/sync")
+        .advanced()
+        .fragmentation(4)
+        .cache(CacheConfig::default())
+        .sample_miss_detection(MissDetectionConfig::default())
+        .wait()
+        .unwrap();
+    publ.put("fragmented synchronous publication")
+        .wait()
+        .unwrap();
+    let sample = sub.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(
+        sample.payload().try_to_string().unwrap(),
+        "fragmented synchronous publication"
+    );
+    session.close().wait().unwrap();
+}
+
+// Upstream timestamp instrumentation must survive both ordinary advanced
+// publications and fragmentation/reassembly over the network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_fragmentation_timestamp_instrumentation() {
+    let (peer1, peer2) = create_peer_pair().await;
+    let sub = ztimeout!(peer2
+        .declare_subscriber("test/fragmentation/instrumentation")
+        .advanced())
+    .unwrap();
+    let publ = ztimeout!(peer1
+        .declare_publisher("test/fragmentation/instrumentation")
+        .advanced()
+        .fragmentation(4)
+        .sample_miss_detection(MissDetectionConfig::default()))
+    .unwrap();
+    tokio::time::sleep(SLEEP).await;
+
+    for payload in ["tiny", "fragmented instrumented publication"] {
+        let instrumentation = TimestampInstrumentationBuilder::new()
+            .set_send(true)
+            .set_receive(true)
+            .build()
+            .unwrap();
+        ztimeout!(publ.put(payload).timestamp_instrumentation(instrumentation)).unwrap();
+        let sample = ztimeout!(sub.recv_async()).unwrap();
+        assert_eq!(sample.payload().try_to_string().unwrap(), payload);
+        let stack = sample.timestamp_stack().expect("missing timestamp stack");
+        let points: Vec<_> = stack
+            .records()
+            .iter()
+            .map(|record| record.point())
+            .collect();
+        assert_eq!(
+            points,
+            [InterceptionPoint::Send, InterceptionPoint::Receive]
+        );
+    }
+}
 
 async fn create_peer_pair() -> (zenoh::Session, zenoh::Session) {
     let locator = format!("tcp/127.0.0.1:{}", zenoh_test::get_free_tcp_port());

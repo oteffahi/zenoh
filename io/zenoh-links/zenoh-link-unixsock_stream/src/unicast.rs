@@ -172,7 +172,7 @@ impl Drop for LinkUnicastUnixSocketStream {
 
 impl fmt::Display for LinkUnicastUnixSocketStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} => {}", &self.src_locator, &self.dst_locator)?;
+        write!(f, "{} => {}", self.src_locator, self.dst_locator)?;
         Ok(())
     }
 }
@@ -478,6 +478,10 @@ impl LinkManagerUnicastTrait for LinkManagerUnicastUnixSocketStream {
             .values()
             .map(|x| x.endpoint.to_locator())
             .collect()
+    }
+
+    async fn get_locators_noloopback(&self) -> Vec<Locator> {
+        self.get_locators().await
     }
 }
 

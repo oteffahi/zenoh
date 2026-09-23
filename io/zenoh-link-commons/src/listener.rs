@@ -138,7 +138,14 @@ impl ListenersUnicastIP {
             .collect()
     }
 
-    pub fn get_locators(&self) -> Vec<Locator> {
+    /// Returns the set of listener locators across all listener endpoints.
+    ///
+    /// When resolving unspecified addresses, loopback addresses are excluded if
+    /// and only if `exclude_unspecified_lo` is set to `true`.
+    ///
+    /// Note that `exclude_unspecified_lo` does not impact "explicit" loopback locators
+    /// (e.g. `tcp/127.0.0.1:9000` or `udp/localhost:0`.)
+    fn get_locators_impl(&self, exclude_unspecified_lo: bool) -> Vec<Locator> {
         let mut locators = vec![];
 
         let guard = zread!(self.listeners);
@@ -150,8 +157,12 @@ impl ListenersUnicastIP {
             // Either ipv4/0.0.0.0 or ipv6/[::]
             if kip.is_unspecified() {
                 let mut addrs = match kip {
-                    IpAddr::V4(_) => zenoh_util::net::get_ipv4_ipaddrs(iface),
-                    IpAddr::V6(_) => zenoh_util::net::get_ipv6_ipaddrs(iface),
+                    IpAddr::V4(_) => {
+                        zenoh_util::net::get_ipv4_ipaddrs(iface, exclude_unspecified_lo)
+                    }
+                    IpAddr::V6(_) => {
+                        zenoh_util::net::get_ipv6_ipaddrs(iface, exclude_unspecified_lo)
+                    }
                 };
                 let iter = addrs.drain(..).map(|x| {
                     Locator::new(
@@ -168,6 +179,17 @@ impl ListenersUnicastIP {
         }
 
         locators
+    }
+
+    /// Returns the set of listener locators across all listener endpoints.
+    pub fn get_locators(&self) -> Vec<Locator> {
+        self.get_locators_impl(false)
+    }
+
+    /// Returns the set of listener locators across all listener endpoints;
+    /// excludes loopback locators obtained by resolving unspecified listener endpoints.
+    pub fn get_locators_noloopback(&self) -> Vec<Locator> {
+        self.get_locators_impl(true)
     }
 }
 
