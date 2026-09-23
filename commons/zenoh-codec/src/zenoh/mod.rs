@@ -18,7 +18,7 @@ pub mod query;
 pub mod reply;
 
 use zenoh_buffers::{
-    reader::{DidntRead, Reader},
+    reader::{DidntRead, HasReader, Reader},
     writer::{DidntWrite, Writer},
     ZBuf,
 };
@@ -222,11 +222,22 @@ where
 }
 
 // Extension: FragInfo
+const FRAG_INFO_FLAG_TIMESTAMP: u8 = 1;
+
 impl<const ID: u8> LCodec<&ext::FragInfoType<{ ID }>> for Zenoh080 {
     fn w_len(self, x: &ext::FragInfoType<{ ID }>) -> usize {
-        let ext::FragInfoType { fcount, fnum } = x;
+        let ext::FragInfoType {
+            fcount,
+            fnum,
+            original_timestamp,
+        } = x;
 
-        1 + self.w_len(*fcount) + self.w_len(*fnum)
+        1 + self.w_len(*fcount)
+            + self.w_len(*fnum)
+            + original_timestamp
+                .as_ref()
+                .map(|timestamp| self.w_len(timestamp))
+                .unwrap_or_default()
     }
 }
 
@@ -238,13 +249,26 @@ where
 
     fn write(self, writer: &mut W, x: (&ext::FragInfoType<{ ID }>, bool)) -> Self::Output {
         let (x, more) = x;
-        let ext::FragInfoType { fcount, fnum } = x;
+        let ext::FragInfoType {
+            fcount,
+            fnum,
+            original_timestamp,
+        } = x;
 
         let header: ZExtZBufHeader<{ ID }> = ZExtZBufHeader::new(self.w_len(x));
         self.write(&mut *writer, (&header, more))?;
 
+        let flags = if original_timestamp.is_some() {
+            FRAG_INFO_FLAG_TIMESTAMP
+        } else {
+            0
+        };
+        self.write(&mut *writer, flags)?;
         self.write(&mut *writer, fcount)?;
         self.write(&mut *writer, fnum)?;
+        if let Some(timestamp) = original_timestamp {
+            self.write(&mut *writer, timestamp)?;
+        }
         Ok(())
     }
 }
@@ -256,12 +280,25 @@ where
     type Error = DidntRead;
 
     fn read(self, reader: &mut R) -> Result<(ext::FragInfoType<{ ID }>, bool), Self::Error> {
-        let (_, more): (ZExtZBufHeader<{ ID }>, bool) = self.read(&mut *reader)?;
+        let (header, more): (ZExtZBufHeader<{ ID }>, bool) = self.read(&mut *reader)?;
+        let body = reader.read_zbuf(header.len)?;
+        let mut reader = body.reader();
 
-        let fcount: u32 = self.codec.read(&mut *reader)?;
-        let fnum: u32 = self.codec.read(&mut *reader)?;
+        let flags: u8 = self.codec.read(&mut reader)?;
+        let fcount: u32 = self.codec.read(&mut reader)?;
+        let fnum: u32 = self.codec.read(&mut reader)?;
+        let original_timestamp = (flags & FRAG_INFO_FLAG_TIMESTAMP != 0)
+            .then(|| self.codec.read(&mut reader))
+            .transpose()?;
 
-        Ok((ext::FragInfoType { fcount, fnum }, more))
+        Ok((
+            ext::FragInfoType {
+                fcount,
+                fnum,
+                original_timestamp,
+            },
+            more,
+        ))
     }
 }
 

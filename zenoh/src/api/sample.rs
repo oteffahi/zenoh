@@ -162,16 +162,33 @@ impl<const ID: u8> From<SourceInfo> for zenoh_protocol::zenoh::ext::SourceInfoTy
 pub struct FragInfo {
     pub(crate) frag_count: FragCount,
     pub(crate) frag_num: FragNum,
+    // TODO: add timestamped sources support.
+    pub(crate) original_timestamp: Option<Timestamp>,
 }
 
 #[zenoh_macros::unstable]
 impl FragInfo {
     #[zenoh_macros::unstable]
-    /// Build a new [`SourceInfo`].
+    /// Build new fragmentation information.
     pub fn new(frag_count: FragCount, frag_num: FragNum) -> Self {
         Self {
             frag_count,
             frag_num,
+            original_timestamp: None,
+        }
+    }
+
+    #[zenoh_macros::unstable]
+    /// Build fragmentation information carrying the timestamp of the original sample.
+    pub fn new_with_timestamp(
+        frag_count: FragCount,
+        frag_num: FragNum,
+        original_timestamp: Timestamp,
+    ) -> Self {
+        Self {
+            frag_count,
+            frag_num,
+            original_timestamp: Some(original_timestamp),
         }
     }
 
@@ -186,6 +203,12 @@ impl FragInfo {
     pub fn frag_num(&self) -> FragNum {
         self.frag_num
     }
+
+    /// The timestamp of the original sample before fragmentation, if present.
+    #[zenoh_macros::unstable]
+    pub fn original_timestamp(&self) -> Option<&Timestamp> {
+        self.original_timestamp.as_ref()
+    }
 }
 
 #[zenoh_macros::unstable]
@@ -194,6 +217,7 @@ impl<const ID: u8> From<zenoh_protocol::zenoh::ext::FragInfoType<ID>> for FragIn
         FragInfo {
             frag_count: value.fcount,
             frag_num: value.fnum,
+            original_timestamp: value.original_timestamp,
         }
     }
 }
@@ -204,6 +228,7 @@ impl<const ID: u8> From<FragInfo> for zenoh_protocol::zenoh::ext::FragInfoType<I
         zenoh_protocol::zenoh::ext::FragInfoType {
             fcount: value.frag_count,
             fnum: value.frag_num,
+            original_timestamp: value.original_timestamp,
         }
     }
 }

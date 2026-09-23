@@ -139,7 +139,7 @@ impl From<Err> for ResponseBody {
 pub mod ext {
     use zenoh_buffers::ZBuf;
 
-    use crate::core::{Encoding, EntityGlobalIdProto};
+    use crate::core::{Encoding, EntityGlobalIdProto, Timestamp};
 
     /// ```text
     ///  7 6 5 4 3 2 1 0
@@ -175,15 +175,20 @@ pub mod ext {
     /// ```text
     ///  7 6 5 4 3 2 1 0
     /// +-+-+-+-+-+-+-+-+
+    /// |X|X|X|X|X|X|X|T|
+    /// +---------------+
     /// %    fcount     %
     /// +---------------+
     /// %     fnum      %
+    /// +---------------+
+    /// ~  original_ts  ~  if T==1
     /// +---------------+
     /// ```
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub struct FragInfoType<const ID: u8> {
         pub fcount: u32,
         pub fnum: u32,
+        pub original_timestamp: Option<Timestamp>,
     }
 
     impl<const ID: u8> FragInfoType<{ ID }> {
@@ -194,7 +199,18 @@ pub mod ext {
 
             let fcount: u32 = rng.gen();
             let fnum: u32 = rng.gen();
-            Self { fcount, fnum }
+            let original_timestamp = rng.gen_bool(0.5).then_some({
+                use crate::core::ZenohIdProto;
+
+                let time = uhlc::NTP64(rng.gen());
+                let id = uhlc::ID::try_from(ZenohIdProto::rand().to_le_bytes()).unwrap();
+                Timestamp::new(time, id)
+            });
+            Self {
+                fcount,
+                fnum,
+                original_timestamp,
+            }
         }
     }
 

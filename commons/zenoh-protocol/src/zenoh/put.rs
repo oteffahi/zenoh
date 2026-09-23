@@ -107,10 +107,7 @@ impl Put {
         let ext_attachment = rng.gen_bool(0.5).then_some(ext::AttachmentType::rand());
         let mut ext_unknown = Vec::new();
         for _ in 0..rng.gen_range(0..4) {
-            ext_unknown.push(ZExtUnknown::rand2(
-                iext::mid(ext::Attachment::ID) + 1,
-                false,
-            ));
+            ext_unknown.push(ZExtUnknown::rand2(iext::mid(ext::FragInfo::ID) + 1, false));
         }
         let payload = ZBuf::rand(rng.gen_range(1..=64));
 
