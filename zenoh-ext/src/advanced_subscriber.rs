@@ -878,6 +878,16 @@ fn deliver_and_flush(
     }
     callback.call(sample);
     state.last_delivered = Some(source_sn);
+    // Remaining fragments at or before last_delivered are rejected as old.
+    // Discard their slots so they cannot block newer samples; the delivery
+    // above already accounted for any missed sequence numbers.
+    while state
+        .pending_samples
+        .first_key_value()
+        .is_some_and(|(sn, _)| *sn <= source_sn)
+    {
+        state.pending_samples.pop_first();
+    }
     while let Some(sample) = remove_and_defrag(&mut state.pending_samples, source_sn + 1) {
         callback.call(sample);
         source_sn += 1;
@@ -948,8 +958,7 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
                     Err(()) => false,
                 }
             } else if max_history_depth == 1 {
-                state.last_delivered = Some(sn);
-                callback.call(sample);
+                deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
                 false
             } else {
                 state
@@ -3402,6 +3411,233 @@ mod tests {
             token: None,
             _gc_task: AbortOnDropHandle::new(ZRuntime::Application.spawn(std::future::pending())),
         }))
+    }
+
+    /// Skipping an incomplete sample must not leave it blocking subsequent
+    /// fragmented samples, even without enough traffic to force eviction.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_delivery_discards_obsolete_partial_samples() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(ZenohId::default(), 7);
+        let key_expr = KeyExpr::try_from("test/ext/pending").unwrap();
+
+        for baseline in [0u32, u32::MAX - 2] {
+            for delete in [false, true] {
+                for successor_first in [false, true] {
+                    let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+                    let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
+                    let statesref =
+                        pending_bound_state(&session, 10, received.clone(), misses.clone());
+                    let handle = |s: Sample| {
+                        handle_sample(&mut zlock!(statesref), s);
+                    };
+                    let frag = |sn: u32, num: u32, payload: &str| {
+                        SampleBuilder::put(key_expr.clone(), payload)
+                            .frag_info(FragInfo::new(2, num))
+                            .source_info(SourceInfo::new(source_id, sn))
+                            .into()
+                    };
+                    let partial = baseline.wrapping_add(1);
+                    let jump = baseline.wrapping_add(2);
+                    let successor = baseline.wrapping_add(3);
+                    handle(
+                        SampleBuilder::put(key_expr.clone(), "base")
+                            .source_info(SourceInfo::new(source_id, baseline))
+                            .into(),
+                    );
+                    handle(frag(partial, 0, "lost"));
+                    let complete_successor = || {
+                        handle(frag(successor, 0, "ab"));
+                        handle(frag(successor, 1, "cd"));
+                    };
+                    if successor_first {
+                        complete_successor();
+                    }
+                    handle(if delete {
+                        SampleBuilder::delete(key_expr.clone())
+                            .source_info(SourceInfo::new(source_id, jump))
+                            .into()
+                    } else {
+                        SampleBuilder::put(key_expr.clone(), "jump")
+                            .source_info(SourceInfo::new(source_id, jump))
+                            .into()
+                    });
+                    if !successor_first {
+                        complete_successor();
+                    }
+
+                    // Late fragments must not resurrect the skipped sample or
+                    // produce another miss notification.
+                    handle(frag(partial, 1, "late"));
+                    handle(frag(partial, 0, "lost"));
+                    let delivered: Vec<_> = received
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|s| s.source_info().unwrap().source_sn())
+                        .collect();
+                    assert_eq!(
+                        delivered,
+                        [baseline, jump, successor],
+                        "baseline={baseline}, delete={delete}, successor_first={successor_first}"
+                    );
+                    assert_eq!(
+                        received.lock().unwrap()[2]
+                            .payload()
+                            .try_to_string()
+                            .unwrap(),
+                        "abcd"
+                    );
+                    assert_eq!(*misses.lock().unwrap(), [1]);
+                    let pending_empty = zlock!(statesref)
+                        .sequenced_states
+                        .peek(&source_id)
+                        .unwrap()
+                        .pending_samples
+                        .is_empty();
+                    assert!(pending_empty);
+                }
+            }
+        }
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// With recovery enabled, a newer complete sample must remain buffered
+    /// while a preceding partial sample is recovered, rather than pruning it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_recovery_preserves_partial_sample_before_complete_successor() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let key_expr = "test/ext/frag/preserve_partial";
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        // Hold the recovery query until the test has inspected the pending
+        // samples, then return only the missing fragment through the reply path.
+        let cache =
+            ztimeout!(session.declare_queryable("test/ext/frag/preserve_partial/@adv/**")).unwrap();
+        let sub = ztimeout!(session
+            .declare_subscriber(key_expr)
+            .advanced()
+            .max_pending_samples(10)
+            .recovery(
+                RecoveryConfig::default().fragments_recovery_delay(Duration::from_millis(50)),
+            ))
+        .unwrap();
+        let misses = ztimeout!(sub.sample_miss_listener()).unwrap();
+
+        ztimeout!(session
+            .put(key_expr, "base")
+            .source_info(SourceInfo::new(source_id, 0)))
+        .unwrap();
+        let baseline = ztimeout!(sub.recv_async()).unwrap();
+        assert_eq!(baseline.source_info().unwrap().source_sn(), 0);
+
+        ztimeout!(session
+            .put(key_expr, "ab")
+            .source_info(SourceInfo::new(source_id, 1))
+            .frag_info(FragInfo::new(2, 0)))
+        .unwrap();
+        ztimeout!(session
+            .put(key_expr, "next")
+            .source_info(SourceInfo::new(source_id, 2)))
+        .unwrap();
+
+        let query = ztimeout!(cache.recv_async()).unwrap();
+        assert_eq!(query.parameters().get("_sn"), Some("1..1"));
+        assert_eq!(query.parameters().get("_fn"), Some("1.."));
+        let (last_delivered, pending) = {
+            let states = zlock!(sub.statesref);
+            let state = states.sequenced_states.peek(&source_id).unwrap();
+            (
+                state.last_delivered,
+                state
+                    .pending_samples
+                    .iter()
+                    .map(|(sn, sample)| (*sn, sample.is_complete()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(last_delivered, Some(WrappingSn(0)));
+        assert_eq!(pending, [(WrappingSn(1), false), (WrappingSn(2), true)]);
+        assert!(sub.try_recv().unwrap().is_none());
+        assert!(misses.try_recv().unwrap().is_none());
+
+        ztimeout!(query.reply_sample(
+            SampleBuilder::put(KeyExpr::try_from(key_expr).unwrap(), "cd")
+                .source_info(SourceInfo::new(source_id, 1))
+                .frag_info(FragInfo::new(2, 1))
+                .into(),
+        ))
+        .unwrap();
+        drop(query);
+
+        for (sn, payload) in [(1, "abcd"), (2, "next")] {
+            let sample = ztimeout!(sub.recv_async()).unwrap();
+            assert_eq!(sample.source_info().unwrap().source_sn(), sn);
+            assert_eq!(sample.payload().try_to_string().unwrap(), payload);
+        }
+        assert!(sub.try_recv().unwrap().is_none());
+        assert!(misses.try_recv().unwrap().is_none());
+        let pending_empty = zlock!(sub.statesref)
+            .sequenced_states
+            .peek(&source_id)
+            .unwrap()
+            .pending_samples
+            .is_empty();
+        assert!(pending_empty);
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// The depth-one history fast path must also discard a partial sample
+    /// when its first delivery establishes a newer sequence-number baseline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_history_delivery_discards_obsolete_partial_samples() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(ZenohId::default(), 7);
+        let key_expr = KeyExpr::try_from("test/ext/pending").unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let statesref = pending_bound_state(&session, 1, received.clone(), misses.clone());
+        {
+            let mut states = zlock!(statesref);
+            states.global_pending_queries = 1;
+            handle_sample(
+                &mut states,
+                SampleBuilder::put(key_expr.clone(), "partial")
+                    .source_info(SourceInfo::new(source_id, 1))
+                    .frag_info(FragInfo::new(2, 0))
+                    .into(),
+            );
+            handle_sample(
+                &mut states,
+                SampleBuilder::put(key_expr, "new")
+                    .source_info(SourceInfo::new(source_id, 2))
+                    .into(),
+            );
+        }
+        let delivered: Vec<_> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.source_info().unwrap().source_sn())
+            .collect();
+        assert_eq!(delivered, [2]);
+        assert!(misses.lock().unwrap().is_empty());
+        let pending_empty = zlock!(statesref)
+            .sequenced_states
+            .peek(&source_id)
+            .unwrap()
+            .pending_samples
+            .is_empty();
+        assert!(pending_empty);
+        ztimeout!(session.close()).unwrap();
     }
 
     /// An incomplete head sample must not block delivery forever: once the
