@@ -11,7 +11,10 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use zenoh::{bytes::ZBytes, internal::zerror, sample::Sample, Result as ZResult};
 
@@ -47,14 +50,17 @@ pub(crate) fn fragment_count(payload_len: usize, size: usize) -> ZResult<u32> {
 /// being `None` for the open-ended tail of a sample.
 pub(crate) type FragRange = (Option<u32>, Option<u32>);
 
-/// The missing fragment ranges of several samples, one `session.get` to be
-/// issued per range.
-pub(crate) type MissingFrags = Vec<(WrappingSn, Vec<FragRange>)>;
+/// Missing ranges and attempt identities for several samples. Each sample's
+/// range queries share one completion handler.
+pub(crate) type MissingFrags = Vec<(WrappingSn, Vec<FragRange>, Arc<()>)>;
 
 #[derive(Debug, Clone)]
 // Keep ordinary samples inline to avoid an extra allocation on the unfragmented path.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum FragmentedSample {
+    /// A failed recovery attempt. Keep a tombstone until delivery or eviction
+    /// passes this sequence number, so late fragments cannot resurrect it.
+    Abandoned,
     Single(Sample),
     Partial {
         frag_count: u32,
@@ -69,17 +75,15 @@ pub(crate) enum FragmentedSample {
         /// recovery scan uses it to detect a stalled sequential stream before
         /// querying the trailing (open-ended) missing range.
         last_arrival: Instant,
-        /// Missing hole ranges already targeted by an immediate recovery
-        /// query, used to avoid re-firing a query on every fragment arrival
-        /// while a hole persists. The recurring recovery scan ignores this
-        /// and re-queries all holes each tick as a safety net.
-        queried_holes: Vec<(u32, u32)>,
+        /// Identity of the single outstanding recovery attempt for this slot.
+        recovery: Option<Arc<()>>,
     },
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) enum FragInsertError {
+    Abandoned,
     InvalidFragNum { frag_count: u32, frag_num: u32 },
     InvalidFragCount { frag_count: u32 },
     CountMismatch { expected: u32, got: u32 },
@@ -100,14 +104,14 @@ impl FragmentedSample {
                 frag_count: 0,
                 frags: Vec::new(),
                 last_arrival: Instant::now(),
-                queried_holes: Vec::new(),
+                recovery: None,
             },
             1 => Self::Single(fragments.into_iter().next().unwrap()),
             n => Self::Partial {
                 frag_count: n as u32,
                 frags: fragments.into_iter().map(Some).collect(),
                 last_arrival: Instant::now(),
-                queried_holes: Vec::new(),
+                recovery: None,
             },
         }
     }
@@ -143,16 +147,72 @@ impl FragmentedSample {
             frag_count,
             frags,
             last_arrival: Instant::now(),
-            queried_holes: Vec::new(),
+            recovery: None,
         })
     }
 
     #[inline]
     pub(crate) fn is_complete(&self) -> bool {
         match self {
+            Self::Abandoned => false,
             Self::Single(_) => true,
             Self::Partial { frags, .. } => !frags.is_empty() && frags.iter().all(Option::is_some),
         }
+    }
+
+    pub(crate) fn is_abandoned(&self) -> bool {
+        matches!(self, Self::Abandoned)
+    }
+
+    pub(crate) fn is_incomplete(&self) -> bool {
+        matches!(self, Self::Partial { .. }) && !self.is_complete()
+    }
+
+    pub(crate) fn recovery_matches(&self, token: &Arc<()>) -> bool {
+        matches!(self, Self::Partial { recovery: Some(current), .. } if Arc::ptr_eq(current, token))
+    }
+
+    /// Reserve one recovery attempt; arrivals and scan ticks cannot overlap it.
+    pub(crate) fn begin_recovery(&mut self) -> Option<Arc<()>> {
+        if !self.is_incomplete() {
+            return None;
+        }
+        let Self::Partial { recovery, .. } = self else {
+            return None;
+        };
+        if recovery.is_some() {
+            return None;
+        }
+        let token = Arc::new(());
+        *recovery = Some(token.clone());
+        Some(token)
+    }
+
+    /// Abandon only if fragments requested by this attempt are still missing.
+    /// An unrequested tail may legitimately still be arriving on the live path.
+    pub(crate) fn finish_recovery(&mut self, token: &Arc<()>, ranges: &[FragRange]) -> bool {
+        let Self::Partial {
+            frags, recovery, ..
+        } = self
+        else {
+            return false;
+        };
+        if !recovery
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, token))
+        {
+            return false;
+        }
+        *recovery = None;
+        let failed = ranges.iter().any(|(start, end)| {
+            let start = start.unwrap_or(0) as usize;
+            let end = end.map(|n| n as usize + 1).unwrap_or(frags.len());
+            frags[start..end].iter().any(Option::is_none)
+        });
+        if failed {
+            *self = Self::Abandoned;
+        }
+        failed
     }
 
     /// Iterate over all fragments. For a `Single` sample yields one element.
@@ -162,6 +222,9 @@ impl FragmentedSample {
     #[inline]
     pub(crate) fn iter_frags(&self) -> FragsIter<'_> {
         match self {
+            Self::Abandoned => FragsIter {
+                inner: FragsIterInner::Single(None),
+            },
             Self::Single(s) => FragsIter {
                 inner: FragsIterInner::Single(Some(s)),
             },
@@ -175,7 +238,7 @@ impl FragmentedSample {
     /// For a complete or single-fragment sample the result is empty.
     pub(crate) fn missing_ranges(&self) -> Vec<FragRange> {
         match self {
-            Self::Single(_) => Vec::new(),
+            Self::Abandoned | Self::Single(_) => Vec::new(),
             Self::Partial { frags, .. } => missing_ranges_impl(frags),
         }
     }
@@ -198,7 +261,7 @@ impl FragmentedSample {
     /// sequential stream that fills it looks stalled. `None` otherwise.
     pub(crate) fn missing_tail(&self, paralysis: Duration) -> Option<FragRange> {
         match self {
-            Self::Single(_) => None,
+            Self::Abandoned | Self::Single(_) => None,
             Self::Partial {
                 frags,
                 last_arrival,
@@ -214,38 +277,6 @@ impl FragmentedSample {
         }
     }
 
-    /// Return the current missing hole ranges not already covered by
-    /// `queried_holes`, and record them there: the caller fires one immediate
-    /// recovery query per returned range. A subsequent call — e.g. after the
-    /// next fragment arrival — only returns *newly opened* or *reshaped*
-    /// holes, preventing redundant queries while a hole persists. `insert`
-    /// prunes `queried_holes` as fragments fill them, so a hole that shrinks
-    /// (e.g. `0..1, 3..4` collapsing to `1..1`) is re-queried for its new
-    /// bounds.
-    pub(crate) fn new_holes(&mut self) -> Vec<FragRange> {
-        let Self::Partial {
-            frags,
-            queried_holes,
-            ..
-        } = self
-        else {
-            return Vec::new();
-        };
-        let mut new = Vec::new();
-        for r in missing_ranges_impl(frags) {
-            if r.1.is_none()
-                || queried_holes
-                    .iter()
-                    .any(|&(s, e)| r.0.unwrap() >= s && r.1.unwrap() <= e)
-            {
-                continue;
-            }
-            queried_holes.push((r.0.unwrap(), r.1.unwrap()));
-            new.push(r);
-        }
-        new
-    }
-
     /// Insert a fragment into this slot.
     ///
     /// Duplicate fragments overwrite previously stored ones.
@@ -254,12 +285,7 @@ impl FragmentedSample {
     /// * `InvalidFragNum` if `frag_num >= frag_count`.
     /// * `InvalidFragCount` if `frag_count == 0`.
     /// * `CountMismatch` if the incoming `frag_count` disagrees with the slot.
-    ///
-    /// # Known limitation
-    /// A slot whose `frag_count` is contradicted by every subsequent fragment
-    /// is locked-until-gone: `CountMismatch` is returned forever. See the
-    /// FIXME in `spawn_frag_recovery` for the resulting unbounded recovery
-    /// query churn.
+    /// * `Abandoned` if recovery already gave up on this slot.
     pub(crate) fn insert(
         &mut self,
         sample: Sample,
@@ -276,6 +302,7 @@ impl FragmentedSample {
             });
         }
         match self {
+            Self::Abandoned => Err(FragInsertError::Abandoned),
             Self::Single(_) => {
                 if frag_count == 1 {
                     *self = Self::Single(sample);
@@ -293,7 +320,7 @@ impl FragmentedSample {
                 frag_count: existing,
                 frags,
                 last_arrival,
-                queried_holes,
+                ..
             } => {
                 if *existing != frag_count {
                     return Err(FragInsertError::CountMismatch {
@@ -303,9 +330,6 @@ impl FragmentedSample {
                 }
                 frags[frag_num as usize] = Some(sample);
                 *last_arrival = Instant::now();
-                // Filling fragments shrinks holes: prune covered ranges so a
-                // hole that shrinks (or disappears) can be re-queried.
-                queried_holes.retain(|&(s, e)| s > frag_num || e < frag_num);
                 Ok(())
             }
         }
@@ -314,6 +338,7 @@ impl FragmentedSample {
     /// Consume this slot and return the reassembled [`Sample`] if complete.
     pub(crate) fn into_sample(self) -> Option<Sample> {
         match self {
+            Self::Abandoned => None,
             Self::Single(s) => Some(s),
             Self::Partial { frags, .. } => {
                 if !frags.iter().all(Option::is_some) {
@@ -525,40 +550,45 @@ mod tests {
     }
 
     #[test]
-    fn new_holes_dedup_and_reshape() {
-        // Fragments 0 and 2 of 5 received: hole (1, 1).
-        let s0 = make_sample("A", 0, 5);
-        let s2 = make_sample("C", 2, 5);
-        let mut fs =
-            FragmentedSample::from_first_fragment(s0, 0, 5, MAX_FRAGMENTS_DEFAULT).unwrap();
-        fs.insert(s2, 2, 5).unwrap();
-        // First call reports the hole and records it.
-        assert_eq!(fs.new_holes(), vec![(Some(1), Some(1))]);
-        // Second call reports nothing while the hole persists.
-        assert!(fs.new_holes().is_empty());
-        // Fragment 3 arrives, reshaping the hole to (1, 1) still — but the
-        // recorded range still covers it, so nothing new.
+    fn recovery_is_exclusive_and_preserves_unrequested_tail() {
+        let mut fs = FragmentedSample::from_first_fragment(
+            make_sample("A", 0, 5),
+            0,
+            5,
+            MAX_FRAGMENTS_DEFAULT,
+        )
+        .unwrap();
         fs.insert(make_sample("D", 3, 5), 3, 5).unwrap();
-        assert!(fs.new_holes().is_empty());
-        // Fragment 4 arrives (completing the tail): the hole is unchanged.
-        fs.insert(make_sample("E", 4, 5), 4, 5).unwrap();
-        assert!(fs.new_holes().is_empty());
-        // Fragment 1 arrives, filling the hole.
+        let ranges = fs.missing_holes();
+        let token = fs.begin_recovery().unwrap();
         fs.insert(make_sample("B", 1, 5), 1, 5).unwrap();
-        assert!(fs.missing_holes().is_empty());
-        // Hole (2, 3) opens: it must be reported.
-        let s5 = make_sample("F", 0, 6);
-        let mut fs2 =
-            FragmentedSample::from_first_fragment(s5, 0, 6, MAX_FRAGMENTS_DEFAULT).unwrap();
-        fs2.insert(make_sample("G", 1, 6), 1, 6).unwrap();
-        fs2.insert(make_sample("H", 4, 6), 4, 6).unwrap();
-        assert_eq!(fs2.new_holes(), vec![(Some(2), Some(3))]);
-        // Reshaping: fragment 2 arrives, the hole shrinks to (3, 3). The new
-        // bounds are within the recorded (2, 3), but `insert` pruned that
-        // range (it contains fragment 2), so the shrunk hole must be
-        // re-reported.
-        fs2.insert(make_sample("I", 2, 6), 2, 6).unwrap();
-        assert_eq!(fs2.new_holes(), vec![(Some(3), Some(3))]);
+        assert!(fs.begin_recovery().is_none());
+        fs.insert(make_sample("C", 2, 5), 2, 5).unwrap();
+        assert!(!fs.finish_recovery(&token, &ranges));
+        assert!(fs.is_incomplete());
+        assert_eq!(fs.missing_tail(ZERO), Some((Some(4), None)));
+        assert!(fs.begin_recovery().is_some());
+    }
+
+    #[test]
+    fn failed_recovery_leaves_terminal_tombstone() {
+        let mut fs = FragmentedSample::from_first_fragment(
+            make_sample("A", 0, 3),
+            0,
+            3,
+            MAX_FRAGMENTS_DEFAULT,
+        )
+        .unwrap();
+        let token = fs.begin_recovery().unwrap();
+        fs.insert(make_sample("B", 1, 3), 1, 3).unwrap();
+        assert!(fs.finish_recovery(&token, &[(Some(1), None)]));
+        assert!(fs.is_abandoned());
+        assert!(!fs.is_incomplete());
+        assert!(fs.begin_recovery().is_none());
+        assert!(matches!(
+            fs.insert(make_sample("C", 2, 3), 2, 3),
+            Err(FragInsertError::Abandoned)
+        ));
     }
 
     #[test]

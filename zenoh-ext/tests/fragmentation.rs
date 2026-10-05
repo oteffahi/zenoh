@@ -21,7 +21,7 @@ use std::{
 
 use zenoh::{
     internal::ztimeout,
-    sample::FragInfo,
+    sample::{FragInfo, SourceInfo},
     timestamp_stack::{InterceptionPoint, TimestampInstrumentationBuilder},
     Config, Wait,
 };
@@ -162,6 +162,65 @@ async fn test_fragmentation_reassembly() {
     let sample = ztimeout!(sub.recv_async()).unwrap();
     assert_eq!(sample.payload().try_to_string().unwrap().as_ref(), payload);
     assert!(sub.try_recv().unwrap().is_none());
+}
+
+// A complete successor must be delivered when the publisher's peer has left
+// and the missing fragments can no longer be recovered from its cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_fragment_recovery_progress_after_publisher_disconnect() {
+    let (publisher_session, subscriber_session) = create_peer_pair().await;
+    let key = "test/fragmentation/disconnect";
+    let publisher = ztimeout!(publisher_session
+        .declare_publisher(key)
+        .advanced()
+        .fragmentation(4)
+        .sample_miss_detection(MissDetectionConfig::default())
+        .cache(CacheConfig::default().max_samples(3)))
+    .unwrap();
+    let source_id = publisher.id();
+    for payload in ["base", "abcdefgh", "next"] {
+        ztimeout!(publisher.put(payload)).unwrap();
+    }
+    let sub = ztimeout!(subscriber_session
+        .declare_subscriber(key)
+        .advanced()
+        .recovery(RecoveryConfig::default().fragments_recovery_delay(Duration::from_millis(20)),)
+        .query_timeout(Duration::from_millis(500)))
+    .unwrap();
+    let misses = ztimeout!(sub.sample_miss_listener()).unwrap();
+    ztimeout!(publisher_session.close()).unwrap();
+
+    // Replay the received subset locally after closing the publishing peer.
+    // This models queued live data and deterministically prevents recovery
+    // from racing with peer shutdown and fetching the missing fragment first.
+    ztimeout!(subscriber_session
+        .put(key, "base")
+        .source_info(SourceInfo::new(source_id, 0)))
+    .unwrap();
+    assert_eq!(
+        ztimeout!(sub.recv_async())
+            .unwrap()
+            .source_info()
+            .unwrap()
+            .source_sn(),
+        0
+    );
+    ztimeout!(subscriber_session
+        .put(key, "abcd")
+        .source_info(SourceInfo::new(source_id, 1))
+        .frag_info(FragInfo::new(2, 0)))
+    .unwrap();
+    ztimeout!(subscriber_session
+        .put(key, "next")
+        .source_info(SourceInfo::new(source_id, 2)))
+    .unwrap();
+    let next = ztimeout!(sub.recv_async()).unwrap();
+    assert_eq!(next.source_info().unwrap().source_sn(), 2);
+    assert_eq!(next.payload().try_to_string().unwrap(), "next");
+    assert_eq!(ztimeout!(misses.recv_async()).unwrap().nb(), 1);
+    assert!(sub.try_recv().unwrap().is_none());
+    assert!(misses.try_recv().unwrap().is_none());
+    ztimeout!(subscriber_session.close()).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
