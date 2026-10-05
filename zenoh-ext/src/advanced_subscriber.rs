@@ -1079,6 +1079,83 @@ fn range(name: &str, start: Option<WrappingSn>, end: Option<WrappingSn>) -> Stri
     }
 }
 
+/// Query missing sequence numbers when recovery is enabled and no query is pending.
+/// Reserve the query under the state lock, then issue it after releasing the lock.
+fn recover_sequence_gap(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
+    let (session, key_expr, query_target, query_timeout, start) = {
+        let mut states = zlock!(statesref);
+        if !states.retransmission || states.callback.is_none() {
+            return;
+        }
+        // A queued recovery check must not recreate a removed source or keep
+        // an idle source alive merely by checking it.
+        let Some(state) = states.sequenced_states.peek_mut(&source_id) else {
+            return;
+        };
+        let Some(last) = state.last_delivered else {
+            return;
+        };
+        // An incomplete entry at the next expected SN is handled by fragment
+        // recovery. Only a sequence-number gap requires a whole-sample query.
+        if state.pending_queries != 0
+            || state.pending_samples.is_empty()
+            || state.pending_samples.keys().next().copied() == Some(last + 1)
+        {
+            return;
+        }
+        // Reserve the query atomically with the gap check: another live sample
+        // or fragment-query completion may concurrently request this check.
+        state.pending_queries += 1;
+        (
+            states.session.clone(),
+            states.key_expr.clone(),
+            states.query_target,
+            states.query_timeout,
+            last + 1,
+        )
+    };
+    let query_expr = &key_expr
+        / KE_ADV_PREFIX
+        / KE_STAR
+        / &source_id.zid().into_keyexpr()
+        / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
+        / KE_STARSTAR;
+    let seq_num_range = range("_sn", Some(start), None);
+    tracing::trace!(
+        "AdvancedSubscriber{{key_expr: {}}}: Querying missing samples {}?{}",
+        key_expr,
+        query_expr,
+        seq_num_range
+    );
+    let handler = SequencedRepliesHandler {
+        source_id,
+        statesref: statesref.clone(),
+    };
+    // Local replies may run synchronously, so never issue the query while
+    // holding the subscriber state lock.
+    let _ = session
+        .get(Selector::from((query_expr, seq_num_range)))
+        .callback(move |r: Reply| {
+            if let Ok(s) = r.into_result() {
+                if key_expr.intersects(s.key_expr()) {
+                    let states = &mut *zlock!(handler.statesref);
+                    tracing::trace!(
+                        "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
+                        states.key_expr,
+                        s.source_info(),
+                        s.timestamp()
+                    );
+                    handle_sample(states, s);
+                }
+            }
+        })
+        .consolidation(ConsolidationMode::None)
+        .accept_replies(ReplyKeyExpr::Any)
+        .target(query_target)
+        .timeout(query_timeout)
+        .wait();
+}
+
 fn spawn_periodic_queries(
     statesref: &Arc<Mutex<State>>,
     period: Option<Duration>,
@@ -1545,7 +1622,6 @@ impl<Handler> AdvancedSubscriber<Handler> {
 
         let sub_callback = {
             let statesref = statesref.clone();
-            let session = conf.session.downgrade();
             let key_expr = key_expr.clone().into_owned();
 
             move |s: Sample| {
@@ -1580,67 +1656,9 @@ impl<Handler> AdvancedSubscriber<Handler> {
                             state.periodic_task =
                                 spawn_periodic_queries(&statesref, states.period, source_id);
                         }
-                        // Whole-sample recovery is needed only when there is a gap
-                        // in sequence numbers (smallest pending SN !=
-                        // last_delivered + 1). An incomplete smallest entry (a
-                        // fragmented sample still missing fragments) is not a
-                        // whole-sample recovery condition: holes are recovered
-                        // immediately by `frag_recovery_on_fragment`, and its
-                        // tail is handled by the fragment recovery task
-                        // (`spawn_frag_recovery`), which issues targeted
-                        // `_fn`-range queries only once the sequential stream
-                        // delivering the sample looks stalled, sending nothing
-                        // under no-loss conditions. Likewise, while
-                        // `last_delivered` is `None` no baseline has been
-                        // established yet (e.g. the first sample of a source is
-                        // still being assembled), so no gap can be detected.
-                        let needs_recovery = state.last_delivered.is_some()
-                            && !state.pending_samples.is_empty()
-                            && state.pending_samples.keys().next().copied()
-                                != state.last_delivered.map(|l| l + 1);
-                        if retransmission.is_some() && state.pending_queries == 0 && needs_recovery
-                        {
-                            state.pending_queries += 1;
-                            let query_expr = &key_expr
-                                / KE_ADV_PREFIX
-                                / KE_STAR
-                                / &source_id.zid().into_keyexpr()
-                                / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
-                                / KE_STARSTAR;
-                            let seq_num_range =
-                                range("_sn", state.last_delivered.map(|s| s + 1), None);
-                            tracing::trace!(
-                                "AdvancedSubscriber{{key_expr: {}}}: Querying missing samples {}?{}",
-                                states.key_expr,
-                                query_expr,
-                                seq_num_range
-                            );
-                            drop(lock);
-                            let handler = SequencedRepliesHandler {
-                                source_id,
-                                statesref: statesref.clone(),
-                            };
-                            let _ = session
-                                .get(Selector::from((query_expr, seq_num_range)))
-                                .callback({
-                                    let key_expr = key_expr.clone().into_owned();
-                                    move |r: Reply| {
-                                        if let Ok(s) = r.into_result() {
-                                            if key_expr.intersects(s.key_expr()) {
-                                                let states = &mut *zlock!(handler.statesref);
-                                                tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                handle_sample(states, s);
-                                            }
-                                        }
-                                    }
-                                })
-                                .consolidation(ConsolidationMode::None)
-                                .accept_replies(ReplyKeyExpr::Any)
-                                .target(query_target)
-                                .timeout(query_timeout)
-                                .wait();
-                        }
                     }
+                    drop(lock);
+                    recover_sequence_gap(&statesref, source_id);
                 }
             }
         };
@@ -2309,7 +2327,8 @@ impl Drop for SequencedRepliesHandler {
 /// the source. Unlike [`SequencedRepliesHandler`], a recovery round that did
 /// not complete a sample must not discard it: the recurring scan keeps
 /// retrying its missing ranges, and further fragments may still arrive for
-/// it.
+/// it. Once the last query completes, recheck sequence gaps that were gated
+/// by the fragment queries.
 #[zenoh_macros::unstable]
 #[derive(Clone)]
 struct FragRecoveryRepliesHandler {
@@ -2320,10 +2339,25 @@ struct FragRecoveryRepliesHandler {
 #[zenoh_macros::unstable]
 impl Drop for FragRecoveryRepliesHandler {
     fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        // use peek_mut so query without samples do not prevent the state to be garbage collected
-        if let Some(state) = states.sequenced_states.peek_mut(&self.source_id) {
+        let should_recheck = {
+            let states = &mut *zlock!(self.statesref);
+            // Queries without samples must not prevent garbage collection.
+            let Some(state) = states.sequenced_states.peek_mut(&self.source_id) else {
+                return;
+            };
             state.pending_queries = state.pending_queries.saturating_sub(1);
+            state.pending_queries == 0
+        };
+        if should_recheck {
+            let statesref = Arc::downgrade(&self.statesref);
+            let source_id = self.source_id;
+            // Do not issue another query recursively from a query callback's
+            // destructor. The helper rechecks current state before reserving it.
+            ZRuntime::Application.spawn(async move {
+                if let Some(statesref) = statesref.upgrade() {
+                    recover_sequence_gap(&statesref, source_id);
+                }
+            });
         }
     }
 }
@@ -2813,6 +2847,83 @@ mod tests {
         }
 
         let _ = ztimeout!(session.close());
+    }
+
+    /// Completing fragment recovery must resume whole-sample recovery if a
+    /// preceding sequence number is still missing, without another live sample
+    /// or a periodic/heartbeat query to trigger it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_fragment_recovery_resumes_whole_sample_recovery() {
+        zenoh_util::init_log_from_env_or("error");
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let key_expr = "test/ext/frag/sequence_gap";
+
+        // Fill the real publisher cache before subscribing. Injecting selected
+        // samples below simulates loss without relying on transport timing.
+        let publ = ztimeout!(session
+            .declare_publisher(key_expr)
+            .advanced()
+            .fragmentation(4)
+            .cache(crate::CacheConfig::default().max_samples(3))
+            .sample_miss_detection(crate::MissDetectionConfig::default()))
+        .unwrap();
+        let source_id = publ.id();
+        for payload in ["base", "lost", PAYLOAD] {
+            ztimeout!(publ.put(payload)).unwrap();
+        }
+
+        let sub = ztimeout!(session.declare_subscriber(key_expr).advanced().recovery(
+            RecoveryConfig::default().fragments_recovery_delay(Duration::from_millis(50)),
+        ))
+        .unwrap();
+        let misses = ztimeout!(sub.sample_miss_listener()).unwrap();
+
+        ztimeout!(session
+            .put(key_expr, "base")
+            .source_info(SourceInfo::new(source_id, 0)))
+        .unwrap();
+        let baseline = ztimeout!(sub.recv_async()).unwrap();
+        assert_eq!(baseline.source_info().unwrap().source_sn(), 0);
+
+        // SN 1 is entirely lost. Receiving fragment 1 of SN 2 opens a hole:
+        // its immediate recovery query temporarily gates whole-sample recovery.
+        ztimeout!(session
+            .put(key_expr, "4567")
+            .source_info(SourceInfo::new(source_id, 2))
+            .frag_info(FragInfo::new(3, 1)))
+        .unwrap();
+
+        for (sn, payload) in [(1, "lost"), (2, PAYLOAD)] {
+            let received = tokio::time::timeout(Duration::from_secs(5), sub.recv_async()).await;
+            if received.is_err() {
+                let diagnostic = {
+                    let states = zlock!(sub.statesref);
+                    let state = states.sequenced_states.peek(&source_id).unwrap();
+                    format!(
+                        "SN {sn} was not delivered after fragment recovery: \
+                         last_delivered={:?}, pending_queries={}, pending_samples={:?}",
+                        state.last_delivered,
+                        state.pending_queries,
+                        state
+                            .pending_samples
+                            .iter()
+                            .map(|(sn, sample)| (*sn, sample.is_complete()))
+                            .collect::<Vec<_>>()
+                    )
+                };
+                ztimeout!(session.close()).unwrap();
+                panic!("{diagnostic}");
+            }
+            let sample = received.unwrap().unwrap();
+            assert_eq!(sample.source_info().unwrap().source_sn(), sn);
+            assert_eq!(sample.payload().try_to_string().unwrap().as_ref(), payload);
+        }
+        assert!(sub.try_recv().unwrap().is_none());
+        assert!(misses.try_recv().unwrap().is_none());
+        ztimeout!(session.close()).unwrap();
     }
 
     /// One recurring scan must recover any number of concurrently incomplete
