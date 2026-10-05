@@ -74,6 +74,9 @@ pub trait SampleBuilderTrait {
 #[zenoh_macros::unstable]
 pub trait FragInfoBuilderTrait {
     /// Attach fragmentation information.
+    ///
+    /// This is an internal API intended for use by
+    /// [`AdvancedPublisher`](https://docs.rs/zenoh-ext).
     fn frag_info<TF: Into<Option<FragInfo>>>(self, frag_info: TF) -> Self;
 }
 
