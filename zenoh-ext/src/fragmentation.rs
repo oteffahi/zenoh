@@ -71,10 +71,10 @@ pub(crate) enum FragmentedSample {
         //       A sparse `BTreeMap<u32, Sample>`, or deferring allocation until
         //       a non-first fragment arrives, should be considered.
         frags: Vec<Option<Sample>>,
-        /// Instant of the most recently accepted fragment: the fragment
-        /// recovery scan uses it to detect a stalled sequential stream before
-        /// querying the trailing (open-ended) missing range.
-        last_arrival: Instant,
+        /// Instant when a previously missing fragment was most recently filled.
+        /// The recovery scan uses it to detect a stalled sequential stream;
+        /// duplicates must not postpone recovery of the missing tail.
+        last_progress: Instant,
         /// Identity of the single outstanding recovery attempt for this slot.
         recovery: Option<Arc<()>>,
     },
@@ -103,14 +103,14 @@ impl FragmentedSample {
             0 => Self::Partial {
                 frag_count: 0,
                 frags: Vec::new(),
-                last_arrival: Instant::now(),
+                last_progress: Instant::now(),
                 recovery: None,
             },
             1 => Self::Single(fragments.into_iter().next().unwrap()),
             n => Self::Partial {
                 frag_count: n as u32,
                 frags: fragments.into_iter().map(Some).collect(),
-                last_arrival: Instant::now(),
+                last_progress: Instant::now(),
                 recovery: None,
             },
         }
@@ -146,7 +146,7 @@ impl FragmentedSample {
         Ok(Self::Partial {
             frag_count,
             frags,
-            last_arrival: Instant::now(),
+            last_progress: Instant::now(),
             recovery: None,
         })
     }
@@ -257,17 +257,18 @@ impl FragmentedSample {
 
     /// Open-ended trailing range of missing fragment numbers (the "tail":
     /// fragments following the highest contiguous received fragment), returned
-    /// only once no fragment of the sample arrived for `delay` — i.e. the
-    /// sequential stream that fills it looks stalled. `None` otherwise.
-    pub(crate) fn missing_tail(&self, paralysis: Duration) -> Option<FragRange> {
+    /// only once no previously missing fragment was filled for `delay` — i.e.
+    /// reassembly looks stalled. Duplicates do not count as progress.
+    /// `None` otherwise.
+    pub(crate) fn missing_tail(&self, delay: Duration) -> Option<FragRange> {
         match self {
             Self::Abandoned | Self::Single(_) => None,
             Self::Partial {
                 frags,
-                last_arrival,
+                last_progress,
                 ..
             } => {
-                if last_arrival.elapsed() < paralysis {
+                if last_progress.elapsed() < delay {
                     return None;
                 }
                 missing_ranges_impl(frags)
@@ -279,7 +280,8 @@ impl FragmentedSample {
 
     /// Insert a fragment into this slot.
     ///
-    /// Duplicate fragments overwrite previously stored ones.
+    /// Duplicate fragments overwrite previously stored ones, but do not reset
+    /// the missing-tail recovery timer.
     ///
     /// # Errors
     /// * `InvalidFragNum` if `frag_num >= frag_count`.
@@ -319,7 +321,7 @@ impl FragmentedSample {
             Self::Partial {
                 frag_count: existing,
                 frags,
-                last_arrival,
+                last_progress,
                 ..
             } => {
                 if *existing != frag_count {
@@ -328,8 +330,12 @@ impl FragmentedSample {
                         got: frag_count,
                     });
                 }
-                frags[frag_num as usize] = Some(sample);
-                *last_arrival = Instant::now();
+                let slot = &mut frags[frag_num as usize];
+                let made_progress = slot.is_none();
+                *slot = Some(sample);
+                if made_progress {
+                    *last_progress = Instant::now();
+                }
                 Ok(())
             }
         }
@@ -403,7 +409,7 @@ fn missing_ranges_impl(frags: &[Option<Sample>]) -> Vec<FragRange> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use zenoh::{
         key_expr::KeyExpr,
@@ -544,9 +550,60 @@ mod tests {
         fs.insert(s3, 3, 5).unwrap();
         assert_eq!(fs.missing_holes(), vec![(Some(2), Some(2))]);
         assert_eq!(fs.missing_tail(ZERO), Some((Some(4), None)));
-        // A fresh arrival gates the tail: `missing_tail` reports nothing until
-        // no fragment arrived for the whole delay.
+        // A previously missing fragment gates the tail: `missing_tail` reports
+        // nothing until reassembly has made no progress for the whole delay.
         assert_eq!(fs.missing_tail(Duration::from_secs(3600)), None);
+    }
+
+    #[test]
+    fn duplicate_fragments_do_not_postpone_tail_recovery() {
+        let delay = Duration::from_secs(60);
+        let stalled = Instant::now() - delay;
+        let mut fs = FragmentedSample::from_first_fragment(
+            make_sample("A", 0, 3),
+            0,
+            3,
+            MAX_FRAGMENTS_DEFAULT,
+        )
+        .unwrap();
+        let FragmentedSample::Partial { last_progress, .. } = &mut fs else {
+            panic!("expected partial assembly");
+        };
+        *last_progress = stalled;
+
+        for _ in 0..5 {
+            fs.insert(make_sample("X", 0, 3), 0, 3).unwrap();
+            let FragmentedSample::Partial { last_progress, .. } = &fs else {
+                panic!("expected partial assembly");
+            };
+            assert_eq!(*last_progress, stalled);
+            assert_eq!(fs.missing_tail(delay), Some((Some(1), None)));
+        }
+    }
+
+    #[test]
+    fn new_fragment_postpones_tail_recovery() {
+        let delay = Duration::from_secs(60);
+        let stalled = Instant::now() - delay;
+        let mut fs = FragmentedSample::from_first_fragment(
+            make_sample("A", 0, 3),
+            0,
+            3,
+            MAX_FRAGMENTS_DEFAULT,
+        )
+        .unwrap();
+        let FragmentedSample::Partial { last_progress, .. } = &mut fs else {
+            panic!("expected partial assembly");
+        };
+        *last_progress = stalled;
+
+        fs.insert(make_sample("B", 1, 3), 1, 3).unwrap();
+        let FragmentedSample::Partial { last_progress, .. } = &fs else {
+            panic!("expected partial assembly");
+        };
+        assert!(*last_progress > stalled);
+        assert_eq!(fs.missing_tail(delay), None);
+        assert_eq!(fs.missing_tail(ZERO), Some((Some(2), None)));
     }
 
     #[test]

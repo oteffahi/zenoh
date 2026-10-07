@@ -149,9 +149,10 @@ impl<const CONFIGURED: bool> RecoveryConfig<CONFIGURED> {
     /// attempt; unsuccessful attempts mark the samples as abandoned.
     ///
     /// The remaining *tail* fragments of an incomplete sample (fragments
-    /// following the highest received one) are only queried once no fragment
-    /// of the sample arrived for this delay: they are normally filled by the
-    /// sequential arrival of the rest of the sample.
+    /// following the highest received one) are only queried once no previously
+    /// missing fragment was received for this delay: they are normally filled
+    /// by the sequential arrival of the rest of the sample. Duplicate fragments
+    /// do not reset this delay.
     ///
     /// Builder will fail if `delay` is zero.
     #[zenoh_macros::unstable]
@@ -1455,9 +1456,10 @@ fn frag_recovery_on_fragment(
 ///   queried unless this sample already has an outstanding attempt.
 /// * the *tail* — the open-ended range following the highest received
 ///   fragment (e.g. fragments 4.. in a sample whose fragments 0..3 arrived)
-///   — is only queried once no fragment of the sample arrived for `delay`:
+///   — is only queried once no previously missing fragment arrived for `delay`:
 ///   it is normally filled by the sequential arrival of the remaining
-///   fragments, and querying it in-flight would be wasted.
+///   fragments, and querying it in-flight would be wasted. Duplicates do not
+///   postpone this recovery.
 ///
 /// The scan exits at the first tick finding no recoverable incomplete sample;
 /// [`arm_frag_recovery`] re-arms it when a new fragmented sample arrives.
@@ -3261,6 +3263,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Duplicate activity must not prevent the recovery scan from querying a
+    /// stalled tail and delivering the reassembled sample.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_fragment_recovery_tail_survives_duplicate_activity() {
+        let delay = Duration::from_millis(50);
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        let key_expr = KeyExpr::try_from("test/ext/frag/duplicate_tail").unwrap();
+        let cache =
+            ztimeout!(session.declare_queryable("test/ext/frag/duplicate_tail/@adv/**")).unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let statesref = frag_recovery_state(&session, &key_expr, received.clone());
+        {
+            let mut states = zlock!(statesref);
+            handle_sample(
+                &mut states,
+                SampleBuilder::put(key_expr.clone(), "base")
+                    .source_info(SourceInfo::new(source_id, 0))
+                    .into(),
+            );
+            let fragment: Sample = SampleBuilder::put(key_expr.clone(), "ab")
+                .source_info(SourceInfo::new(source_id, 1))
+                .frag_info(FragInfo::new(2, 0))
+                .into();
+            let (_, new_frag) = handle_sample(&mut states, fragment.clone());
+            let state = states.sequenced_states.peek_mut(&source_id).unwrap();
+            frag_recovery_on_fragment(
+                &statesref,
+                &key_expr,
+                state,
+                source_id,
+                WrappingSn(1),
+                new_frag,
+                delay,
+            );
+            let FragmentedSample::Partial { last_progress, .. } =
+                state.pending_samples.get_mut(&WrappingSn(1)).unwrap()
+            else {
+                panic!("expected partial assembly");
+            };
+            *last_progress = Instant::now() - Duration::from_secs(1);
+
+            // Age and duplicate under one lock so the scan cannot run between
+            // them. Duplicates must leave the tail immediately recoverable.
+            for _ in 0..5 {
+                handle_sample(&mut states, fragment.clone());
+            }
+            assert_eq!(
+                states
+                    .sequenced_states
+                    .peek(&source_id)
+                    .unwrap()
+                    .pending_samples
+                    .get(&WrappingSn(1))
+                    .unwrap()
+                    .missing_tail(delay),
+                Some((Some(1), None))
+            );
+        }
+
+        let query = ztimeout!(cache.recv_async()).unwrap();
+        assert_eq!(query.parameters().get("_sn"), Some("1..1"));
+        assert_eq!(query.parameters().get("_fn"), Some("1.."));
+        ztimeout!(query.reply_sample(
+            SampleBuilder::put(key_expr, "cd")
+                .source_info(SourceInfo::new(source_id, 1))
+                .frag_info(FragInfo::new(2, 1))
+                .into(),
+        ))
+        .unwrap();
+        drop(query);
+        ztimeout!(async {
+            loop {
+                if received.lock().unwrap().len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        {
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), 2);
+            assert_eq!(received[0].source_info().unwrap().source_sn(), 0);
+            assert_eq!(received[1].source_info().unwrap().source_sn(), 1);
+            assert_eq!(received[1].payload().try_to_string().unwrap(), "abcd");
+        }
+        assert!(cache.try_recv().unwrap().is_none());
+        ztimeout!(session.close()).unwrap();
     }
 
     /// A hole opened by an out-of-order fragment (e.g. receiving 0, 1, 3 of
