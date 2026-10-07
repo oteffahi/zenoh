@@ -1259,10 +1259,19 @@ fn spawn_periodic_queries(
 fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
     let mut guard = statesref.lock().unwrap();
     let states = &mut *guard;
+    // Initial/history queries already retrieve these samples.
+    if states.global_pending_queries != 0 {
+        return;
+    }
     // use peek_mut so query without samples do not prevent the state to be garbage collected
     let Some(state) = states.sequenced_states.peek_mut(&source_id) else {
         return;
     };
+    // Coalesce ticks while ordinary queries or fragment recovery are pending,
+    // allowing their completion to bring the counter to zero and flush gaps.
+    if state.pending_queries != 0 {
+        return;
+    }
     state.pending_queries += 1;
     let query_expr = &states.key_expr
         / KE_ADV_PREFIX
@@ -3596,6 +3605,164 @@ mod tests {
                 );
             }
         }
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// Periodic ticks must not overlap a held query: its completion must flush
+    /// a complete successor across an unrecoverable sequence-number gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_periodic_queries_coalesce_and_flush_unrecoverable_gap() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        let cache = ztimeout!(session.declare_queryable("test/ext/pending/@adv/**")).unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
+        let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let statesref = pending_bound_state(&session, 10, received.clone(), misses.clone());
+        {
+            let mut states = zlock!(statesref);
+            states.retransmission = true;
+            for (sn, payload) in [(0, "base"), (2, "next")] {
+                handle_sample(
+                    &mut states,
+                    SampleBuilder::put(KeyExpr::try_from("test/ext/pending").unwrap(), payload)
+                        .source_info(SourceInfo::new(source_id, sn))
+                        .into(),
+                );
+            }
+        }
+
+        // Invoke the tick helper directly to avoid timing-dependent overlap.
+        periodic_query(&statesref, source_id);
+        let query = ztimeout!(cache.recv_async()).unwrap();
+        assert_eq!(query.parameters().get("_sn"), Some("1.."));
+        for _ in 0..5 {
+            periodic_query(&statesref, source_id);
+            let states = zlock!(statesref);
+            let state = states.sequenced_states.peek(&source_id).unwrap();
+            assert_eq!(state.pending_queries, 1);
+            assert_eq!(state.last_delivered, Some(WrappingSn(0)));
+        }
+        assert!(cache.try_recv().unwrap().is_none());
+        assert_eq!(received.lock().unwrap().len(), 1);
+
+        // SN 1 is no longer cached. Finishing the only query must release SN 2.
+        drop(query);
+        ztimeout!(async {
+            loop {
+                if zlock!(statesref)
+                    .sequenced_states
+                    .peek(&source_id)
+                    .unwrap()
+                    .pending_queries
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let delivered: Vec<_> = received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.source_info().unwrap().source_sn())
+            .collect();
+        assert_eq!(delivered, [0, 2]);
+        assert_eq!(*misses.lock().unwrap(), [1]);
+        assert!(zlock!(statesref)
+            .sequenced_states
+            .peek(&source_id)
+            .unwrap()
+            .pending_samples
+            .is_empty());
+
+        // Coalescing must not disable subsequent periodic recovery.
+        periodic_query(&statesref, source_id);
+        let query = ztimeout!(cache.recv_async()).unwrap();
+        assert_eq!(query.parameters().get("_sn"), Some("3.."));
+        assert_eq!(
+            zlock!(statesref)
+                .sequenced_states
+                .peek(&source_id)
+                .unwrap()
+                .pending_queries,
+            1
+        );
+        drop(query);
+        ztimeout!(async {
+            loop {
+                if zlock!(statesref)
+                    .sequenced_states
+                    .peek(&source_id)
+                    .unwrap()
+                    .pending_queries
+                    == 0
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        assert_eq!(received.lock().unwrap().len(), 2);
+        assert_eq!(*misses.lock().unwrap(), [1]);
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// Periodic queries must respect both global history reservations and
+    /// per-source ordinary/fragment recovery reservations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_periodic_queries_respect_pending_queries() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        let cache = ztimeout!(session.declare_queryable("test/ext/pending/@adv/**")).unwrap();
+        let statesref = pending_bound_state(
+            &session,
+            10,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        for (global_pending, source_pending) in [(1, 0), (0, 1)] {
+            {
+                let mut states = zlock!(statesref);
+                states.global_pending_queries = global_pending;
+                states
+                    .sequenced_states
+                    .get_or_insert_mut(source_id, Default::default)
+                    .pending_queries = source_pending;
+            }
+            periodic_query(&statesref, source_id);
+            {
+                let states = zlock!(statesref);
+                assert_eq!(states.global_pending_queries, global_pending);
+                assert_eq!(
+                    states
+                        .sequenced_states
+                        .peek(&source_id)
+                        .unwrap()
+                        .pending_queries,
+                    source_pending
+                );
+            }
+            assert!(cache.try_recv().unwrap().is_none());
+        }
+        {
+            let mut states = zlock!(statesref);
+            states
+                .sequenced_states
+                .peek_mut(&source_id)
+                .unwrap()
+                .pending_queries = 0;
+        }
+        periodic_query(&statesref, source_id);
+        let query = ztimeout!(cache.recv_async()).unwrap();
+        assert_eq!(query.parameters().get("_sn"), Some(".."));
+        drop(query);
         ztimeout!(session.close()).unwrap();
     }
 
