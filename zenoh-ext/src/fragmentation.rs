@@ -54,12 +54,22 @@ pub(crate) type FragRange = (Option<u32>, Option<u32>);
 /// range queries share one completion handler.
 pub(crate) type MissingFrags = Vec<(WrappingSn, Vec<FragRange>, Arc<()>)>;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) enum FragmentRecovery {
+    #[default]
+    Idle,
+    InFlight(Arc<()>),
+    /// Failure is provisional until it blocks a newer complete sample.
+    /// Also establishes the cooldown before another recovery attempt.
+    FailedAt(Instant),
+}
+
 #[derive(Debug, Clone)]
 // Keep ordinary samples inline to avoid an extra allocation on the unfragmented path.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum FragmentedSample {
-    /// A failed recovery attempt. Keep a tombstone until delivery or eviction
-    /// passes this sequence number, so late fragments cannot resurrect it.
+    /// Recovery failed and abandonment was needed to unblock a complete successor.
+    /// Keep a tombstone until delivery or eviction passes this sequence number.
     Abandoned,
     Single(Sample),
     Partial {
@@ -75,8 +85,7 @@ pub(crate) enum FragmentedSample {
         /// The recovery scan uses it to detect a stalled sequential stream;
         /// duplicates must not postpone recovery of the missing tail.
         last_progress: Instant,
-        /// Identity of the single outstanding recovery attempt for this slot.
-        recovery: Option<Arc<()>>,
+        recovery: FragmentRecovery,
     },
 }
 
@@ -104,14 +113,14 @@ impl FragmentedSample {
                 frag_count: 0,
                 frags: Vec::new(),
                 last_progress: Instant::now(),
-                recovery: None,
+                recovery: FragmentRecovery::Idle,
             },
             1 => Self::Single(fragments.into_iter().next().unwrap()),
             n => Self::Partial {
                 frag_count: n as u32,
                 frags: fragments.into_iter().map(Some).collect(),
                 last_progress: Instant::now(),
-                recovery: None,
+                recovery: FragmentRecovery::Idle,
             },
         }
     }
@@ -147,7 +156,7 @@ impl FragmentedSample {
             frag_count,
             frags,
             last_progress: Instant::now(),
-            recovery: None,
+            recovery: FragmentRecovery::Idle,
         })
     }
 
@@ -169,26 +178,47 @@ impl FragmentedSample {
     }
 
     pub(crate) fn recovery_matches(&self, token: &Arc<()>) -> bool {
-        matches!(self, Self::Partial { recovery: Some(current), .. } if Arc::ptr_eq(current, token))
+        matches!(self, Self::Partial { recovery: FragmentRecovery::InFlight(current), .. } if Arc::ptr_eq(current, token))
+    }
+
+    pub(crate) fn is_retry(&self) -> bool {
+        matches!(
+            self,
+            Self::Partial {
+                recovery: FragmentRecovery::FailedAt(_),
+                ..
+            }
+        )
+    }
+
+    /// A failed attempt can justify abandonment only while no genuine fragment
+    /// progress has occurred since. Progress earns the assembly a fresh attempt.
+    pub(crate) fn can_abandon(&self) -> bool {
+        self.is_incomplete()
+            && matches!(self, Self::Partial {
+                recovery: FragmentRecovery::FailedAt(failed_at), last_progress, ..
+            } if last_progress <= failed_at)
     }
 
     /// Reserve one recovery attempt; arrivals and scan ticks cannot overlap it.
-    pub(crate) fn begin_recovery(&mut self) -> Option<Arc<()>> {
+    pub(crate) fn begin_recovery(&mut self, retry_delay: Duration) -> Option<Arc<()>> {
         if !self.is_incomplete() {
             return None;
         }
         let Self::Partial { recovery, .. } = self else {
             return None;
         };
-        if recovery.is_some() {
-            return None;
+        match recovery {
+            FragmentRecovery::InFlight(_) => return None,
+            FragmentRecovery::FailedAt(at) if at.elapsed() < retry_delay => return None,
+            _ => {}
         }
         let token = Arc::new(());
-        *recovery = Some(token.clone());
+        *recovery = FragmentRecovery::InFlight(token.clone());
         Some(token)
     }
 
-    /// Abandon only if fragments requested by this attempt are still missing.
+    /// Record failure only if fragments requested by this attempt are missing.
     /// An unrequested tail may legitimately still be arriving on the live path.
     pub(crate) fn finish_recovery(&mut self, token: &Arc<()>, ranges: &[FragRange]) -> bool {
         let Self::Partial {
@@ -197,21 +227,19 @@ impl FragmentedSample {
         else {
             return false;
         };
-        if !recovery
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, token))
-        {
+        if !matches!(recovery, FragmentRecovery::InFlight(current) if Arc::ptr_eq(current, token)) {
             return false;
         }
-        *recovery = None;
         let failed = ranges.iter().any(|(start, end)| {
             let start = start.unwrap_or(0) as usize;
             let end = end.map(|n| n as usize + 1).unwrap_or(frags.len());
             frags[start..end].iter().any(Option::is_none)
         });
-        if failed {
-            *self = Self::Abandoned;
-        }
+        *recovery = if failed {
+            FragmentRecovery::FailedAt(Instant::now())
+        } else {
+            FragmentRecovery::Idle
+        };
         failed
     }
 
@@ -617,18 +645,18 @@ mod tests {
         .unwrap();
         fs.insert(make_sample("D", 3, 5), 3, 5).unwrap();
         let ranges = fs.missing_holes();
-        let token = fs.begin_recovery().unwrap();
+        let token = fs.begin_recovery(ZERO).unwrap();
         fs.insert(make_sample("B", 1, 5), 1, 5).unwrap();
-        assert!(fs.begin_recovery().is_none());
+        assert!(fs.begin_recovery(ZERO).is_none());
         fs.insert(make_sample("C", 2, 5), 2, 5).unwrap();
         assert!(!fs.finish_recovery(&token, &ranges));
         assert!(fs.is_incomplete());
         assert_eq!(fs.missing_tail(ZERO), Some((Some(4), None)));
-        assert!(fs.begin_recovery().is_some());
+        assert!(fs.begin_recovery(ZERO).is_some());
     }
 
     #[test]
-    fn failed_recovery_leaves_terminal_tombstone() {
+    fn failed_recovery_preserves_fragments_and_enforces_cooldown() {
         let mut fs = FragmentedSample::from_first_fragment(
             make_sample("A", 0, 3),
             0,
@@ -636,16 +664,71 @@ mod tests {
             MAX_FRAGMENTS_DEFAULT,
         )
         .unwrap();
-        let token = fs.begin_recovery().unwrap();
+        let token = fs.begin_recovery(ZERO).unwrap();
         fs.insert(make_sample("B", 1, 3), 1, 3).unwrap();
         assert!(fs.finish_recovery(&token, &[(Some(1), None)]));
-        assert!(fs.is_abandoned());
-        assert!(!fs.is_incomplete());
-        assert!(fs.begin_recovery().is_none());
-        assert!(matches!(
-            fs.insert(make_sample("C", 2, 3), 2, 3),
-            Err(FragInsertError::Abandoned)
-        ));
+        assert!(!fs.is_abandoned());
+        assert!(fs.is_incomplete());
+        assert!(fs.can_abandon());
+        assert!(fs.begin_recovery(Duration::from_secs(60)).is_none());
+        assert!(!fs.recovery_matches(&token));
+        // Duplicates do not erase failure or bypass the cooldown.
+        fs.insert(make_sample("A", 0, 3), 0, 3).unwrap();
+        assert!(fs.can_abandon());
+        assert!(fs.begin_recovery(Duration::from_secs(60)).is_none());
+        fs.insert(make_sample("C", 2, 3), 2, 3).unwrap();
+        assert!(fs.is_complete());
+        assert!(!fs.can_abandon());
+        assert_eq!(
+            fs.into_sample().unwrap().payload().try_to_string().unwrap(),
+            "ABC"
+        );
+    }
+
+    #[test]
+    fn retry_cooldown_expires_and_stale_attempt_cannot_finish_retry() {
+        let delay = Duration::from_secs(60);
+        let mut fs = FragmentedSample::from_first_fragment(
+            make_sample("A", 0, 3),
+            0,
+            3,
+            MAX_FRAGMENTS_DEFAULT,
+        )
+        .unwrap();
+        let first = fs.begin_recovery(ZERO).unwrap();
+        assert!(fs.finish_recovery(&first, &[(Some(1), None)]));
+        assert!(fs.begin_recovery(delay).is_none());
+        let FragmentedSample::Partial { recovery, .. } = &mut fs else {
+            panic!("expected partial assembly");
+        };
+        *recovery = super::FragmentRecovery::FailedAt(Instant::now() - delay);
+        let retry = fs.begin_recovery(delay).unwrap();
+        assert!(!fs.can_abandon());
+        assert!(!fs.finish_recovery(&first, &[(Some(1), None)]));
+        assert!(fs.recovery_matches(&retry));
+        assert!(fs.begin_recovery(ZERO).is_none());
+    }
+
+    #[test]
+    fn progress_after_failure_earns_a_fresh_attempt() {
+        let mut fs = FragmentedSample::from_first_fragment(
+            make_sample("C", 2, 4),
+            2,
+            4,
+            MAX_FRAGMENTS_DEFAULT,
+        )
+        .unwrap();
+        let attempt = fs.begin_recovery(ZERO).unwrap();
+        assert!(fs.finish_recovery(&attempt, &[(Some(0), Some(1))]));
+        assert!(fs.can_abandon());
+        fs.insert(make_sample("A", 0, 4), 0, 4).unwrap();
+        assert!(fs.is_incomplete());
+        assert!(!fs.can_abandon());
+        let retry = fs.begin_recovery(ZERO).unwrap();
+        fs.insert(make_sample("B", 1, 4), 1, 4).unwrap();
+        assert!(!fs.finish_recovery(&retry, &[(Some(1), Some(1))]));
+        assert!(!fs.can_abandon());
+        assert_eq!(fs.missing_tail(ZERO), Some((Some(3), None)));
     }
 
     #[test]

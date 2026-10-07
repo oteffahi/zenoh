@@ -116,9 +116,10 @@ impl HistoryConfig {
 #[derive(Debug, Clone, Copy)]
 /// Configure retransmission.
 ///
-/// Missing fragments are queried only when recovery is enabled. A sample is
-/// abandoned if any requested fragments are still missing when its recovery
-/// attempt finishes (including timeout), allowing complete successors to advance.
+/// Missing fragments are queried only when recovery is enabled. Fragment
+/// recovery failure (including timeout) is provisional while no newer complete
+/// sample is waiting. Failed assemblies are retried after the fragment recovery
+/// delay, or abandoned when needed to let a complete successor advance.
 #[zenoh_macros::unstable]
 pub struct RecoveryConfig<const CONFIGURED: bool = true> {
     frag_recovery_delay: Duration,
@@ -146,7 +147,8 @@ impl<const CONFIGURED: bool> RecoveryConfig<CONFIGURED> {
     /// received fragments on both sides, which sequential arrival can never
     /// fill — e.g. fragment 2 when fragments 0, 1 and 3 arrived) are queried
     /// immediately on detection. A sample has at most one outstanding recovery
-    /// attempt; unsuccessful attempts mark the samples as abandoned.
+    /// attempt. Unsuccessful attempts are retried after this delay unless the
+    /// failed assembly blocks a newer complete sample, in which case it is abandoned.
     ///
     /// The remaining *tail* fragments of an incomplete sample (fragments
     /// following the highest received one) are only queried once no previously
@@ -377,7 +379,8 @@ impl<'a, 'c, Handler, const BACKGROUND: bool>
     /// [`max_pending_samples`](AdvancedSubscriberBuilder::max_pending_samples).
     ///
     /// Incomplete fragmented samples are preserved across ordinary query
-    /// completion until they complete, fragment recovery fails, or they are evicted.
+    /// completion until they complete, failed recovery blocks a complete successor,
+    /// or they are evicted. A final incomplete sample remains recoverable after failure.
     #[zenoh_macros::unstable]
     #[inline]
     pub fn recovery(mut self, conf: RecoveryConfig) -> Self {
@@ -878,8 +881,41 @@ fn next_expected_sn(state: &SourceState<WrappingSn>) -> Option<WrappingSn> {
 /// Stop at recoverable partials or unknown gaps. Tombstones remain until
 /// delivery retires them.
 fn pop_next_ready_sample(state: &mut SourceState<WrappingSn>) -> Option<(WrappingSn, Sample)> {
+    abandon_failed_barrier(state);
     let sn = next_expected_sn(state)?;
     remove_and_defrag(&mut state.pending_samples, sn).map(|sample| (sn, sample))
+}
+
+/// Abandon only the first unresolved assembly, after recovery failure, if a
+/// complete successor is waiting. Unknown gaps still require ordinary recovery.
+fn abandon_failed_barrier(state: &mut SourceState<WrappingSn>) {
+    loop {
+        let Some((&sn, sample)) = state
+            .pending_samples
+            .iter()
+            .find(|(_, sample)| !sample.is_abandoned())
+        else {
+            return;
+        };
+        if !sample.can_abandon()
+            || !state
+                .pending_samples
+                .range((std::ops::Bound::Excluded(sn), std::ops::Bound::Unbounded))
+                .any(|(_, sample)| sample.is_complete())
+        {
+            return;
+        }
+        // Do not abandon farther down the delivery path while an unknown gap
+        // or an earlier complete sample is still waiting to be processed.
+        if next_expected_sn(state).is_some_and(|next| sn > next)
+            && !state.pending_flush.is_some_and(|through| sn <= through)
+        {
+            return;
+        }
+        state
+            .pending_samples
+            .insert(sn, FragmentedSample::Abandoned);
+    }
 }
 
 #[zenoh_macros::unstable]
@@ -1412,7 +1448,8 @@ fn arm_frag_recovery(
 ///   attempt. The scan handles new holes and stalled tails after that attempt.
 ///
 /// Each attempt reserves one `pending_queries` count, released only after all
-/// its range queries finish. Failure abandons the sample instead of retrying.
+/// its range queries finish. Failure remains retryable unless delivery needs
+/// to advance to a complete successor.
 fn frag_recovery_on_fragment(
     statesref: &Arc<Mutex<State>>,
     key_expr: &KeyExpr<'static>,
@@ -1428,11 +1465,14 @@ fn frag_recovery_on_fragment(
     let Some(sample) = state.pending_samples.get_mut(&sn) else {
         return;
     };
+    if state.pending_queries != 0 && sample.is_retry() {
+        return;
+    }
     let holes = sample.missing_holes();
     if holes.is_empty() {
         return;
     }
-    let Some(attempt) = sample.begin_recovery() else {
+    let Some(attempt) = sample.begin_recovery(delay) else {
         return;
     };
     state.pending_queries += 1;
@@ -1472,7 +1512,8 @@ fn frag_recovery_on_fragment(
 /// [`arm_frag_recovery`] re-arms it when a new fragmented sample arrives.
 ///
 /// Each sample reserves one outstanding attempt atomically with its ranges.
-/// An unsuccessful attempt leaves a tombstone and is never retried.
+/// An unsuccessful attempt enforces a cooldown of `delay` before retrying.
+/// Only failures blocking complete successors become terminal tombstones.
 fn spawn_frag_recovery(
     statesref: Arc<Mutex<State>>,
     key_expr: KeyExpr<'static>,
@@ -1496,7 +1537,13 @@ fn spawn_frag_recovery(
                     return;
                 }
                 let mut missing: MissingFrags = Vec::new();
+                let queries_pending = state.pending_queries != 0;
                 for (sn, frags) in state.pending_samples.iter_mut() {
+                    // A retry must not replenish the counter while other
+                    // queries are finishing and need to flush buffered data.
+                    if queries_pending && frags.is_retry() {
+                        continue;
+                    }
                     let mut ranges = frags.missing_holes();
                     // Only query the tail once the sequential stream it is
                     // expected from looks stalled.
@@ -1504,7 +1551,7 @@ fn spawn_frag_recovery(
                         ranges.push(tail);
                     }
                     if !ranges.is_empty() {
-                        if let Some(attempt) = frags.begin_recovery() {
+                        if let Some(attempt) = frags.begin_recovery(delay) {
                             missing.push((*sn, ranges, attempt));
                         }
                     }
@@ -2296,6 +2343,9 @@ fn resume_sequenced_flush(
         return;
     };
     loop {
+        if retransmission {
+            abandon_failed_barrier(state);
+        }
         if state.last_delivered.is_some_and(|last| last >= through)
             || state.last_evicted.is_some_and(|last| last >= through)
         {
@@ -2461,7 +2511,8 @@ impl Drop for SequencedRepliesHandler {
 /// Reply handler for fragment-recovery queries.
 ///
 /// Shared by every range query of one sample's recovery attempt. On completion,
-/// abandon only that sample if any requested fragments are still missing.
+/// record a provisional failure if requested fragments are still missing.
+/// Abandon a failed barrier only when a complete successor is waiting.
 ///
 /// Release ready successors without passing other recoverable partials.
 /// Unknown gaps may be passed only within an ordinary query's captured flush
@@ -2491,6 +2542,9 @@ impl Drop for FragRecoveryRepliesHandler {
             state.pending_queries = state.pending_queries.saturating_sub(1);
             if let Some(sample) = state.pending_samples.get_mut(&self.sn) {
                 sample.finish_recovery(&self.attempt, &self.ranges);
+            }
+            if states.global_pending_queries == 0 {
+                abandon_failed_barrier(state);
             }
             let last_query = state.pending_queries == 0;
             if last_query && states.global_pending_queries == 0 {
@@ -3905,8 +3959,381 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// A failed sample stays abandoned even without a successor to advance the
-    /// delivery watermark. Later live data and whole-sample replies are ignored.
+    /// A final sample stays recoverable after an empty/error/timeout response,
+    /// through either live fragments or a later ordinary retransmission.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_final_fragmented_sample_recovers_after_failure() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        let key = KeyExpr::try_from("test/ext/frag/final_retry").unwrap();
+        for failure in ["empty", "error", "timeout"] {
+            for recovery in ["live", "ordinary", "whole"] {
+                let cache =
+                    ztimeout!(session.declare_queryable("test/ext/frag/final_retry/@adv/**"))
+                        .unwrap();
+                let sub = ztimeout!(session
+                    .declare_subscriber(&key)
+                    .advanced()
+                    .recovery(
+                        RecoveryConfig::default().fragments_recovery_delay(Duration::from_secs(60))
+                    )
+                    .query_timeout(Duration::from_millis(100)))
+                .unwrap();
+                let misses = ztimeout!(sub.sample_miss_listener()).unwrap();
+                ztimeout!(session
+                    .put(&key, "base")
+                    .source_info(SourceInfo::new(source_id, 0)))
+                .unwrap();
+                ztimeout!(sub.recv_async()).unwrap();
+                ztimeout!(session
+                    .put(&key, "ef")
+                    .source_info(SourceInfo::new(source_id, 1))
+                    .frag_info(FragInfo::new(3, 2)))
+                .unwrap();
+                let query = ztimeout!(cache.recv_async()).unwrap();
+                assert_eq!(query.parameters().get("_fn"), Some("0..1"));
+                if failure == "error" {
+                    ztimeout!(query.reply_err("temporarily unavailable")).unwrap();
+                }
+                let held = if failure == "timeout" {
+                    Some(query)
+                } else {
+                    drop(query);
+                    None
+                };
+                ztimeout!(async {
+                    loop {
+                        let failed = {
+                            let states = zlock!(sub.statesref);
+                            let state = states.sequenced_states.peek(&source_id).unwrap();
+                            state.pending_queries == 0
+                                && state
+                                    .pending_samples
+                                    .get(&WrappingSn(1))
+                                    .is_some_and(FragmentedSample::can_abandon)
+                        };
+                        if failed {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                });
+                drop(held);
+                {
+                    let states = zlock!(sub.statesref);
+                    let slot = states
+                        .sequenced_states
+                        .peek(&source_id)
+                        .unwrap()
+                        .pending_samples
+                        .get(&WrappingSn(1))
+                        .unwrap();
+                    assert!(slot.is_incomplete());
+                    assert!(!slot.is_abandoned());
+                    assert_eq!(slot.iter_frags().count(), 1);
+                }
+                assert!(sub.try_recv().unwrap().is_none());
+                assert!(misses.try_recv().unwrap().is_none());
+                assert!(cache.try_recv().unwrap().is_none());
+
+                if recovery == "live" {
+                    for (num, payload) in [(0, "ab"), (1, "cd")] {
+                        ztimeout!(session
+                            .put(&key, payload)
+                            .source_info(SourceInfo::new(source_id, 1))
+                            .frag_info(FragInfo::new(3, num)))
+                        .unwrap();
+                    }
+                } else {
+                    periodic_query(&sub.statesref, source_id);
+                    let query = ztimeout!(cache.recv_async()).unwrap();
+                    assert_eq!(query.parameters().get("_sn"), Some("1.."));
+                    assert!(query.parameters().get("_fn").is_none());
+                    if recovery == "whole" {
+                        ztimeout!(query.reply_sample(
+                            SampleBuilder::put(key.clone(), "abcdef")
+                                .source_info(SourceInfo::new(source_id, 1))
+                                .into()
+                        ))
+                        .unwrap();
+                    } else {
+                        for (num, payload) in [(0, "ab"), (1, "cd")] {
+                            ztimeout!(query.reply_sample(
+                                SampleBuilder::put(key.clone(), payload)
+                                    .source_info(SourceInfo::new(source_id, 1))
+                                    .frag_info(FragInfo::new(3, num))
+                                    .into()
+                            ))
+                            .unwrap();
+                        }
+                    }
+                    drop(query);
+                }
+                let sample = ztimeout!(sub.recv_async()).unwrap();
+                assert_eq!(sample.source_info().unwrap().source_sn(), 1);
+                assert_eq!(sample.payload().try_to_string().unwrap(), "abcdef");
+                assert!(sub.try_recv().unwrap().is_none());
+                assert!(misses.try_recv().unwrap().is_none());
+            }
+        }
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// Only a complete successor, not another partial, makes a retained
+    /// recovery failure terminal. Cover wraparound and late retransmissions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_later_complete_successor_abandons_failed_sample() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        let key = "test/ext/frag/later_successor";
+        for baseline in [0u32, u32::MAX - 1] {
+            let partial = baseline.wrapping_add(1);
+            let successor = baseline.wrapping_add(2);
+            let cache =
+                ztimeout!(session.declare_queryable("test/ext/frag/later_successor/@adv/**"))
+                    .unwrap();
+            let sub = ztimeout!(session.declare_subscriber(key).advanced().recovery(
+                RecoveryConfig::default().fragments_recovery_delay(Duration::from_secs(60))
+            ))
+            .unwrap();
+            let misses = ztimeout!(sub.sample_miss_listener()).unwrap();
+            ztimeout!(session
+                .put(key, "base")
+                .source_info(SourceInfo::new(source_id, baseline)))
+            .unwrap();
+            ztimeout!(sub.recv_async()).unwrap();
+            ztimeout!(session
+                .put(key, "b")
+                .source_info(SourceInfo::new(source_id, partial))
+                .frag_info(FragInfo::new(2, 1)))
+            .unwrap();
+            drop(ztimeout!(cache.recv_async()).unwrap());
+            ztimeout!(async {
+                loop {
+                    if zlock!(sub.statesref)
+                        .sequenced_states
+                        .peek(&source_id)
+                        .unwrap()
+                        .pending_samples
+                        .get(&WrappingSn(partial))
+                        .unwrap()
+                        .can_abandon()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            ztimeout!(session
+                .put(key, "c")
+                .source_info(SourceInfo::new(source_id, successor))
+                .frag_info(FragInfo::new(2, 0)))
+            .unwrap();
+            {
+                let states = zlock!(sub.statesref);
+                let state = states.sequenced_states.peek(&source_id).unwrap();
+                assert!(state
+                    .pending_samples
+                    .get(&WrappingSn(partial))
+                    .unwrap()
+                    .can_abandon());
+                assert_eq!(state.pending_samples.len(), 2);
+                assert_eq!(state.last_delivered, Some(WrappingSn(baseline)));
+            }
+            assert!(misses.try_recv().unwrap().is_none());
+            ztimeout!(session
+                .put(key, "d")
+                .source_info(SourceInfo::new(source_id, successor))
+                .frag_info(FragInfo::new(2, 1)))
+            .unwrap();
+            let sample = ztimeout!(sub.recv_async()).unwrap();
+            assert_eq!(sample.source_info().unwrap().source_sn(), successor);
+            assert_eq!(sample.payload().try_to_string().unwrap(), "cd");
+            assert_eq!(ztimeout!(misses.recv_async()).unwrap().nb(), 1);
+            ztimeout!(session
+                .put(key, "a")
+                .source_info(SourceInfo::new(source_id, partial))
+                .frag_info(FragInfo::new(2, 0)))
+            .unwrap();
+            assert!(sub.try_recv().unwrap().is_none());
+            assert!(misses.try_recv().unwrap().is_none());
+            assert!(cache.try_recv().unwrap().is_none());
+        }
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// Automatic retries remain exclusive, and a complete successor arriving
+    /// during a retry must wait for that attempt's opportunity to succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_automatic_fragment_retry_can_win_against_successor() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        let key = KeyExpr::try_from("test/ext/frag/automatic_retry").unwrap();
+        let cache =
+            ztimeout!(session.declare_queryable("test/ext/frag/automatic_retry/@adv/**")).unwrap();
+        let sub = ztimeout!(session.declare_subscriber(&key).advanced().recovery(
+            RecoveryConfig::default().fragments_recovery_delay(Duration::from_millis(50))
+        ))
+        .unwrap();
+        let misses = ztimeout!(sub.sample_miss_listener()).unwrap();
+        ztimeout!(session
+            .put(&key, "base")
+            .source_info(SourceInfo::new(source_id, 0)))
+        .unwrap();
+        ztimeout!(sub.recv_async()).unwrap();
+        ztimeout!(session
+            .put(&key, "ef")
+            .source_info(SourceInfo::new(source_id, 1))
+            .frag_info(FragInfo::new(3, 2)))
+        .unwrap();
+        drop(ztimeout!(cache.recv_async()).unwrap());
+        let retry = ztimeout!(cache.recv_async()).unwrap();
+        assert_eq!(retry.parameters().get("_sn"), Some("1..1"));
+        assert_eq!(retry.parameters().get("_fn"), Some("0..1"));
+        ztimeout!(session
+            .put(&key, "next")
+            .source_info(SourceInfo::new(source_id, 2)))
+        .unwrap();
+        for _ in 0..5 {
+            ztimeout!(session
+                .put(&key, "ef")
+                .source_info(SourceInfo::new(source_id, 1))
+                .frag_info(FragInfo::new(3, 2)))
+            .unwrap();
+        }
+        assert!(sub.try_recv().unwrap().is_none());
+        assert!(cache.try_recv().unwrap().is_none());
+        assert_eq!(
+            zlock!(sub.statesref)
+                .sequenced_states
+                .peek(&source_id)
+                .unwrap()
+                .pending_queries,
+            1
+        );
+        for (num, payload) in [(0, "ab"), (1, "cd")] {
+            ztimeout!(retry.reply_sample(
+                SampleBuilder::put(key.clone(), payload)
+                    .source_info(SourceInfo::new(source_id, 1))
+                    .frag_info(FragInfo::new(3, num))
+                    .into()
+            ))
+            .unwrap();
+        }
+        drop(retry);
+        for (sn, payload) in [(1, "abcdef"), (2, "next")] {
+            let sample = ztimeout!(sub.recv_async()).unwrap();
+            assert_eq!(sample.source_info().unwrap().source_sn(), sn);
+            assert_eq!(sample.payload().try_to_string().unwrap(), payload);
+        }
+        assert!(sub.try_recv().unwrap().is_none());
+        assert!(misses.try_recv().unwrap().is_none());
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// Failed-slot retries must not replenish the pending-query counter while
+    /// an ordinary query is outstanding, through scans or duplicate arrivals.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_fragment_retry_waits_for_ordinary_query() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = ztimeout!(zenoh::open(config)).unwrap();
+        let source_id = EntityGlobalId::new(session.zid(), 7);
+        let key = KeyExpr::try_from("test/ext/frag/retry_overlap").unwrap();
+        let cache =
+            ztimeout!(session.declare_queryable("test/ext/frag/retry_overlap/@adv/**")).unwrap();
+        let delay = Duration::from_millis(200);
+        let sub = ztimeout!(session
+            .declare_subscriber(&key)
+            .advanced()
+            .recovery(RecoveryConfig::default().fragments_recovery_delay(delay)))
+        .unwrap();
+        ztimeout!(session
+            .put(&key, "base")
+            .source_info(SourceInfo::new(source_id, 0)))
+        .unwrap();
+        ztimeout!(sub.recv_async()).unwrap();
+        ztimeout!(session
+            .put(&key, "ef")
+            .source_info(SourceInfo::new(source_id, 1))
+            .frag_info(FragInfo::new(3, 2)))
+        .unwrap();
+        drop(ztimeout!(cache.recv_async()).unwrap());
+        ztimeout!(async {
+            loop {
+                if zlock!(sub.statesref)
+                    .sequenced_states
+                    .peek(&source_id)
+                    .unwrap()
+                    .pending_samples
+                    .get(&WrappingSn(1))
+                    .unwrap()
+                    .can_abandon()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        periodic_query(&sub.statesref, source_id);
+        let ordinary = ztimeout!(cache.recv_async()).unwrap();
+        assert!(ordinary.parameters().get("_fn").is_none());
+        // More than a full cooldown and scan period elapse while this query is held.
+        assert!(tokio::time::timeout(delay * 3, cache.recv_async())
+            .await
+            .is_err());
+        for _ in 0..5 {
+            ztimeout!(session
+                .put(&key, "ef")
+                .source_info(SourceInfo::new(source_id, 1))
+                .frag_info(FragInfo::new(3, 2)))
+            .unwrap();
+        }
+        assert!(cache.try_recv().unwrap().is_none());
+        assert_eq!(
+            zlock!(sub.statesref)
+                .sequenced_states
+                .peek(&source_id)
+                .unwrap()
+                .pending_queries,
+            1
+        );
+        drop(ordinary);
+        let retry = ztimeout!(cache.recv_async()).unwrap();
+        assert_eq!(retry.parameters().get("_fn"), Some("0..1"));
+        for (num, payload) in [(0, "ab"), (1, "cd")] {
+            ztimeout!(retry.reply_sample(
+                SampleBuilder::put(key.clone(), payload)
+                    .source_info(SourceInfo::new(source_id, 1))
+                    .frag_info(FragInfo::new(3, num))
+                    .into()
+            ))
+            .unwrap();
+        }
+        drop(retry);
+        assert_eq!(
+            ztimeout!(sub.recv_async())
+                .unwrap()
+                .payload()
+                .try_to_string()
+                .unwrap(),
+            "abcdef"
+        );
+        ztimeout!(session.close()).unwrap();
+    }
+
+    /// Abandonment needed by a complete successor stays terminal even while
+    /// another partial prevents advancing the delivery watermark.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_abandoned_sample_cannot_be_resurrected() {
         let mut config = Config::default();
@@ -3917,9 +4344,10 @@ mod tests {
         let key = "test/ext/frag/abandoned";
         let cache =
             ztimeout!(session.declare_queryable("test/ext/frag/abandoned/@adv/**")).unwrap();
-        let sub = ztimeout!(session.declare_subscriber(key).advanced().recovery(
-            RecoveryConfig::default().fragments_recovery_delay(Duration::from_millis(20))
-        ))
+        let sub = ztimeout!(session
+            .declare_subscriber(key)
+            .advanced()
+            .recovery(RecoveryConfig::default().fragments_recovery_delay(Duration::from_secs(10))))
         .unwrap();
         let misses = ztimeout!(sub.sample_miss_listener()).unwrap();
         ztimeout!(session
@@ -3928,9 +4356,18 @@ mod tests {
         .unwrap();
         ztimeout!(sub.recv_async()).unwrap();
         ztimeout!(session
-            .put(key, "ab")
+            .put(key, "b")
             .source_info(SourceInfo::new(source_id, 1))
+            .frag_info(FragInfo::new(2, 1)))
+        .unwrap();
+        ztimeout!(session
+            .put(key, "c")
+            .source_info(SourceInfo::new(source_id, 2))
             .frag_info(FragInfo::new(2, 0)))
+        .unwrap();
+        ztimeout!(session
+            .put(key, "next")
+            .source_info(SourceInfo::new(source_id, 3)))
         .unwrap();
         drop(ztimeout!(cache.recv_async()).unwrap());
         ztimeout!(async {
@@ -3965,8 +4402,9 @@ mod tests {
         assert!(misses.try_recv().unwrap().is_none());
         drop(cache);
         ztimeout!(session
-            .put(key, "next")
-            .source_info(SourceInfo::new(source_id, 2)))
+            .put(key, "d")
+            .source_info(SourceInfo::new(source_id, 2))
+            .frag_info(FragInfo::new(2, 1)))
         .unwrap();
         assert_eq!(
             ztimeout!(sub.recv_async())
@@ -3977,6 +4415,14 @@ mod tests {
             2
         );
         assert_eq!(ztimeout!(misses.recv_async()).unwrap().nb(), 1);
+        assert_eq!(
+            ztimeout!(sub.recv_async())
+                .unwrap()
+                .source_info()
+                .unwrap()
+                .source_sn(),
+            3
+        );
         ztimeout!(session.close()).unwrap();
     }
 
@@ -4214,7 +4660,7 @@ mod tests {
                     .unwrap()
                     .pending_samples
                     .get(&WrappingSn(0))
-                    .is_some_and(FragmentedSample::is_abandoned);
+                    .is_some_and(FragmentedSample::can_abandon);
                 if abandoned {
                     break;
                 }
@@ -4570,7 +5016,7 @@ mod tests {
                 .pending_samples
                 .get_mut(&WrappingSn(1))
                 .unwrap()
-                .begin_recovery()
+                .begin_recovery(Duration::ZERO)
                 .unwrap();
             state.pending_queries = 1;
             FragRecoveryRepliesHandler {
@@ -5007,7 +5453,7 @@ mod tests {
                     .pending_samples
                     .get_mut(&WrappingSn(1))
                     .unwrap()
-                    .begin_recovery()
+                    .begin_recovery(Duration::ZERO)
                     .unwrap();
                 state.pending_queries = 2;
                 (state.generation.clone(), attempt)
