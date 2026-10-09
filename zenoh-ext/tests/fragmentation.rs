@@ -13,7 +13,7 @@
 //
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -21,7 +21,9 @@ use std::{
 
 use zenoh::{
     internal::ztimeout,
-    sample::{FragInfo, SourceInfo},
+    key_expr::KeyExpr,
+    sample::{FragInfo, SampleBuilder, SourceInfo},
+    session::EntityGlobalId,
     timestamp_stack::{InterceptionPoint, TimestampInstrumentationBuilder},
     Config, Wait,
 };
@@ -67,7 +69,89 @@ fn test_fragmentation_periodic_recovery_without_tokio_runtime() {
     session.close().wait().unwrap();
 }
 
-// Upstream timestamp instrumentation must survive both ordinary advanced
+// A queryable may publish fragments while answering another query. Recovery
+// must not call that queryable again on the same stack: callback_mut holds a
+// mutex until the first call returns.
+#[test]
+fn test_fragment_recovery_does_not_reenter_queryable() {
+    thread_local! {
+        static IN_QUERY_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    let mut config = Config::default();
+    config.scouting.multicast.set_enabled(Some(false)).unwrap();
+    config.listen.endpoints.set(vec![]).unwrap();
+    let session = zenoh::open(config).wait().unwrap();
+    let source_id = EntityGlobalId::new(session.zid(), 7);
+    let key = "test/fragmentation/reentrant_query";
+    let sub = session
+        .declare_subscriber(key)
+        .advanced()
+        .recovery(RecoveryConfig::default().fragments_recovery_delay(Duration::from_secs(60)))
+        .wait()
+        .unwrap();
+    let reentered = Arc::new(AtomicBool::new(false));
+    let serialized_callback = zenoh::handlers::locked({
+        let session = session.downgrade();
+        move |query: zenoh::query::Query| {
+            IN_QUERY_CALLBACK.with(|active| active.set(true));
+            if query.parameters().get("start") == Some("1") {
+                // Fragment 1 of the first sample triggers fragment recovery,
+                // without a sequence-number gap triggering sample recovery.
+                session
+                    .put(key, "B")
+                    .source_info(SourceInfo::new(source_id, 0))
+                    .frag_info(FragInfo::new(2, 1))
+                    .wait()
+                    .unwrap();
+            } else {
+                assert_eq!(query.parameters().get("_sn"), Some("0..0"));
+                assert_eq!(query.parameters().get("_fn"), Some("0..0"));
+                query
+                    .reply_sample(
+                        SampleBuilder::put(KeyExpr::try_from(key).unwrap(), "A")
+                            .source_info(SourceInfo::new(source_id, 0))
+                            .frag_info(FragInfo::new(2, 0))
+                            .into(),
+                    )
+                    .wait()
+                    .unwrap();
+            }
+            IN_QUERY_CALLBACK.with(|active| active.set(false));
+        }
+    });
+    let _cache = session
+        .declare_queryable("test/fragmentation/reentrant_query/@adv/**")
+        .callback({
+            let reentered = reentered.clone();
+            move |query| {
+                // Use the same lock as callback_mut, but detect same-thread
+                // re-entry before locking so a regression fails instead of hanging.
+                if IN_QUERY_CALLBACK.with(|active| active.get()) {
+                    reentered.store(true, Ordering::SeqCst);
+                    return;
+                }
+                serialized_callback(query);
+            }
+        })
+        .wait()
+        .unwrap();
+
+    let _replies = session
+        .get("test/fragmentation/reentrant_query/@adv/**?start=1")
+        .wait()
+        .unwrap();
+    assert!(
+        !reentered.load(Ordering::SeqCst),
+        "fragment recovery re-entered the queryable callback"
+    );
+    let sample = sub.recv_timeout(TIMEOUT).unwrap().unwrap();
+    assert_eq!(sample.payload().try_to_string().unwrap(), "AB");
+    assert!(sub.try_recv().unwrap().is_none());
+    session.close().wait().unwrap();
+}
+
+// Upstream timestamp instrumentation must survive both unfragmented advanced
 // publications and fragmentation/reassembly over the network.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_fragmentation_timestamp_instrumentation() {
@@ -310,7 +394,7 @@ async fn test_fragmentation_multislice_payload() {
 }
 
 // In-order fragmented publications under no-loss conditions must not trigger
-// any recovery query: whole-sample recovery fires only on sequence-number
+// any recovery query: sample recovery in this test runs only on sequence-number
 // gaps, and the fragment recovery timer finds the sample complete when it
 // fires after `frag_recovery_delay`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -318,8 +402,8 @@ async fn test_no_recovery_query_on_in_order_fragmentation() {
     zenoh_util::init_log_from_env_or("error");
     let (peer1, peer2) = create_peer_pair().await;
 
-    // Spy queryable counting any query reaching the @adv space. Recovery
-    // queries (whole-sample or fragment-level) are the only queries this
+    // Spy queryable counting any query reaching the @adv space. Sample-recovery
+    // and fragment-recovery queries are the only queries this
     // setup can emit: no history is configured on the subscriber.
     let query_count = Arc::new(AtomicUsize::new(0));
     let _spy = ztimeout!(peer2
@@ -355,7 +439,7 @@ async fn test_no_recovery_query_on_in_order_fragmentation() {
 
     // Wait beyond the fragment recovery delay (1s by default) so that any
     // armed fragment recovery timer has fired, and any immediate
-    // whole-sample recovery query has been emitted.
+    // sample-recovery query has been sent.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // All samples must have been delivered in order via the live path.
