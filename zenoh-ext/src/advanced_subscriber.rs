@@ -11,16 +11,7 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::{
-    cmp::min,
-    collections::{btree_map, BTreeMap},
-    fmt,
-    future::IntoFuture,
-    hash::Hash,
-    str::FromStr,
-    sync::Weak,
-    time::Instant,
-};
+use std::{cmp::min, fmt, future::IntoFuture, hash::Hash, str::FromStr, sync::Weak, time::Instant};
 
 use lru::LruCache;
 use tokio_util::task::AbortOnDropHandle;
@@ -31,12 +22,10 @@ use zenoh::{
     key_expr::KeyExpr,
     liveliness::{LivelinessSubscriberBuilder, LivelinessToken},
     pubsub::{SubscriberBuilder, SubscriberUndeclaration},
-    query::{
-        ConsolidationMode, Parameters, Selector, TimeBound, TimeExpr, TimeRange, ZenohParameters,
-    },
-    sample::{Locality, Sample, SampleKind, SourceInfo},
+    query::Selector,
+    sample::{Locality, Sample, SampleKind},
     session::{EntityGlobalId, EntityId},
-    Resolvable, Session, Wait, KE_ADV_PREFIX, KE_EMPTY, KE_PUB, KE_STAR, KE_STARSTAR, KE_SUB,
+    Resolvable, Session, Wait, KE_ADV_PREFIX, KE_EMPTY, KE_PUB, KE_STARSTAR, KE_SUB,
 };
 #[zenoh_macros::unstable]
 use {
@@ -49,18 +38,26 @@ use {
     zenoh::handlers::{locked, DefaultHandler},
     zenoh::internal::{runtime::ZRuntime, zlock},
     zenoh::pubsub::Subscriber,
-    zenoh::query::{QueryTarget, Reply, ReplyKeyExpr},
+    zenoh::query::QueryTarget,
     zenoh::session::WeakSession,
-    zenoh::time::Timestamp,
     zenoh::Result as ZResult,
 };
 
 use crate::{
     advanced_cache::{ke_liveliness, KE_UHLC},
-    fragmentation::{FragRange, FragmentedSample, MissingFrags, MAX_FRAGMENTS_DEFAULT},
+    fragmentation::{FragmentedSample, MAX_FRAGMENTS_DEFAULT},
     utils::WrappingSn,
     z_deserialize,
 };
+
+mod recovery;
+mod source;
+#[cfg(test)]
+use recovery::FragmentAttempt;
+use recovery::{
+    InitialRepliesHandler, QueryContext, SequencedRepliesHandler, TimestampedRepliesHandler,
+};
+use source::{SequencedSource, TimestampedSource};
 
 /// Default bound on the number of samples buffered per source for reordering
 /// and fragment reassembly. Overridable via
@@ -116,10 +113,9 @@ impl HistoryConfig {
 #[derive(Debug, Clone, Copy)]
 /// Configure retransmission.
 ///
-/// Missing fragments are queried only when recovery is enabled. Fragment
-/// recovery failure (including timeout) is provisional while no newer complete
-/// sample is waiting. Failed assemblies are retried after the fragment recovery
-/// delay, or abandoned when needed to let a complete successor advance.
+/// Missing fragments are queried only when recovery is enabled. If recovery
+/// fails or times out, the subscriber waits before retrying. It gives up on an
+/// incomplete sample when needed to deliver a newer complete sample.
 #[zenoh_macros::unstable]
 pub struct RecoveryConfig<const CONFIGURED: bool = true> {
     frag_recovery_delay: Duration,
@@ -141,20 +137,17 @@ impl<const CONFIGURED: bool> Default for RecoveryConfig<CONFIGURED> {
 
 #[zenoh_macros::unstable]
 impl<const CONFIGURED: bool> RecoveryConfig<CONFIGURED> {
-    /// Specify the period of the fragment recovery scan.
+    /// Set how often to check for missing fragments and how long to wait before retrying.
     ///
-    /// Missing *hole* fragments of an incomplete sample (fragments bounded by
-    /// received fragments on both sides, which sequential arrival can never
-    /// fill — e.g. fragment 2 when fragments 0, 1 and 3 arrived) are queried
-    /// immediately on detection. A sample has at most one outstanding recovery
-    /// attempt. Unsuccessful attempts are retried after this delay unless the
-    /// failed assembly blocks a newer complete sample, in which case it is abandoned.
+    /// Missing fragments before the highest received fragment are queried right
+    /// away. For example, receiving fragments 0, 1 and 3 triggers a query for
+    /// fragment 2. Only one recovery attempt runs at a time for each sample.
+    /// If it fails, the subscriber waits for this delay before retrying, or gives
+    /// up on the sample if needed to deliver a newer complete sample.
     ///
-    /// The remaining *tail* fragments of an incomplete sample (fragments
-    /// following the highest received one) are only queried once no previously
-    /// missing fragment was received for this delay: they are normally filled
-    /// by the sequential arrival of the rest of the sample. Duplicate fragments
-    /// do not reset this delay.
+    /// Fragments after the highest received fragment may still be on their way.
+    /// The subscriber queries for them only after no new fragment has arrived
+    /// for this delay. Duplicate fragments do not restart the wait.
     ///
     /// Builder will fail if `delay` is zero.
     #[zenoh_macros::unstable]
@@ -378,9 +371,11 @@ impl<'a, 'c, Handler, const BACKGROUND: bool>
     /// Samples buffered while awaiting retransmission are bounded: see
     /// [`max_pending_samples`](AdvancedSubscriberBuilder::max_pending_samples).
     ///
-    /// Incomplete fragmented samples are preserved across ordinary query
-    /// completion until they complete, failed recovery blocks a complete successor,
-    /// or they are evicted. A final incomplete sample remains recoverable after failure.
+    /// Finishing a history or sample-recovery query does not discard samples
+    /// with missing fragments. The subscriber keeps trying to recover them. It gives up if
+    /// recovery fails and a newer complete sample needs to be delivered, or if
+    /// the buffer limit requires discarding them. If no newer complete sample
+    /// is waiting, failed recovery can be retried.
     #[zenoh_macros::unstable]
     #[inline]
     pub fn recovery(mut self, conf: RecoveryConfig) -> Self {
@@ -549,14 +544,14 @@ impl IntoFuture for AdvancedSubscriberBuilder<'_, '_, '_, Callback<Sample>, true
 struct State {
     next_id: usize,
     global_pending_queries: u64,
-    sequenced_states: LruCache<EntityGlobalId, SourceState<WrappingSn>>,
-    timestamped_states: LruCache<ID, SourceState<Timestamp>>,
+    sequenced_states: LruCache<EntityGlobalId, SequencedSource>,
+    timestamped_states: LruCache<ID, TimestampedSource>,
     session: WeakSession,
     key_expr: KeyExpr<'static>,
     retransmission: bool,
     frag_recovery_delay: Duration,
     period: Option<Duration>,
-    max_history_depth: usize,
+    max_pending_samples: usize,
     query_target: QueryTarget,
     query_timeout: Duration,
     max_fragments: u32,
@@ -581,49 +576,6 @@ impl State {
     #[zenoh_macros::unstable]
     fn unregister_miss_callback(&mut self, id: &usize) {
         self.miss_handlers.remove(id);
-    }
-}
-
-#[zenoh_macros::unstable]
-struct SourceState<T> {
-    /// Distinguish this source state from one recreated after garbage collection.
-    generation: Arc<()>,
-    last_delivered: Option<T>,
-    /// Evicted entries, including abandonment tombstones, must not reappear.
-    last_evicted: Option<T>,
-    /// Outstanding ordinary queries plus per-sample fragment recovery attempts.
-    pending_queries: u64,
-    /// Ordinary-query delivery deferred by outstanding queries or a partial.
-    /// The boundary prevents later publications inheriting permission to skip gaps.
-    pending_flush: Option<WrappingSn>,
-    pending_samples: BTreeMap<T, FragmentedSample>,
-    /// Latest access instant used for garbage collection with retention period
-    latest_access: Instant,
-    /// Periodic queries task
-    periodic_task: Option<AbortOnDropHandle<()>>,
-    /// Recurring fragment-recovery scan task: each tick queries the missing
-    /// fragments of every incomplete sample of this source. Armed when a
-    /// fragmented sample slot is created, aborted once a tick finds nothing
-    /// incomplete (or when the state is dropped).
-    frag_recovery_task: Option<AbortOnDropHandle<()>>,
-    /// Alive as per liveliness subscriber
-    alive: bool,
-}
-
-impl<T> Default for SourceState<T> {
-    fn default() -> Self {
-        Self {
-            generation: Arc::new(()),
-            last_delivered: None,
-            last_evicted: None,
-            pending_queries: 0,
-            pending_flush: None,
-            pending_samples: BTreeMap::new(),
-            periodic_task: None,
-            frag_recovery_task: None,
-            alive: false,
-            latest_access: Instant::now(),
-        }
     }
 }
 
@@ -734,278 +686,26 @@ impl<Receiver> std::ops::DerefMut for AdvancedSubscriber<Receiver> {
     }
 }
 
-/// Insert a sample (fragmented or not) into the per-source pending map.
-///
-/// Non-fragmented samples are stored as [`FragmentedSample::Single`]. Fragmented
-/// samples are added to the partial slot for their sequence number, creating it
-/// if necessary. The function validates the fragment metadata:
-/// * `frag_num` must be strictly smaller than `frag_count`;
-/// * `frag_count` must not exceed `max_fragments` (DoS/memory bound);
-/// * all fragments of a given sequence number must agree on `frag_count`.
-///
-/// Returns `Ok(true)` when the insertion created a new sequence-number slot.
-/// This is used by the caller to decide whether to start a fragment-recovery
-/// timer for a newly seen fragmented sample.
-#[cfg(feature = "unstable")]
-fn insert_fragment(
-    state: &mut SourceState<WrappingSn>,
-    sample: Sample,
-    source_info: &SourceInfo,
-    max_fragments: u32,
-) -> Result<bool, ()> {
-    let sn: WrappingSn = source_info.source_sn().into();
-    match sample.frag_info() {
-        None => {
-            let new = !state.pending_samples.contains_key(&sn);
-            state
-                .pending_samples
-                .insert(sn, FragmentedSample::single(sample));
-            Ok(new)
-        }
-        Some(fi) => {
-            let frag_count = fi.frag_count();
-            let frag_num = fi.frag_num();
-            let new = !state.pending_samples.contains_key(&sn);
-            match state.pending_samples.entry(sn) {
-                btree_map::Entry::Vacant(v) => {
-                    match FragmentedSample::from_first_fragment(
-                        sample,
-                        frag_num,
-                        frag_count,
-                        max_fragments,
-                    ) {
-                        Ok(fs) => {
-                            v.insert(fs);
-                            Ok(new)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "AdvancedSubscriber: rejected fragment (sn={sn}): {e:?}"
-                            );
-                            Err(())
-                        }
-                    }
-                }
-                btree_map::Entry::Occupied(mut o) => {
-                    if let Err(e) = o.get_mut().insert(sample, frag_num, frag_count) {
-                        tracing::warn!("AdvancedSubscriber: rejected fragment (sn={sn}): {e:?}");
-                        Err(())
-                    } else {
-                        Ok(new)
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Enforce the subscriber's `max_history_depth` on the pending sample map.
-///
-/// `handle_sample` buffers every incoming sequenced sample, including fragments.
-/// If the buffer grows past the configured depth we drop the oldest entry so
-/// memory stays bounded. Complete samples are delivered (and any consecutive
-/// complete successors are flushed via [`deliver_and_flush`]); incomplete
-/// samples are discarded without reporting: misses are accounted by
-/// [`deliver_and_flush`] when a delivery closes the gap.
-///
-/// This is called after every insertion because fragments may arrive slowly and
-/// the head entry could stay incomplete for an unbounded time otherwise.
-#[zenoh_macros::unstable]
-fn maybe_evict_oldest(
-    state: &mut SourceState<WrappingSn>,
-    callback: &Callback<Sample>,
-    miss_handlers: &HashMap<usize, Callback<Miss>>,
-    source_id: EntityGlobalId,
-    max_history_depth: usize,
-) {
-    // Use `>` so that a single in-flight fragmented sample is not evicted
-    // immediately under `max_history_depth == 1`. Memory is still bounded by
-    // the per-slot `max_fragments` limit.
-    while state.pending_samples.len() > max_history_depth.max(1) {
-        let (sn, fs) = state
-            .pending_samples
-            .pop_first()
-            .expect("non-empty pending_samples");
-        if let Some(sample) = fs.into_sample() {
-            deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
-        } else {
-            state.last_evicted = Some(sn);
-            // Miss accounting happens at delivery, not at eviction. Edge case:
-            // an incomplete entry evicted as the last pending entry with no
-            // later delivery is never reported.
-            tracing::info!(
-                "AdvancedSubscriber: evicted incomplete sample at sn={sn} due to max_history_depth={max_history_depth}"
-            );
-            // Advancing the eviction watermark can unblock complete survivors
-            // even when the buffer is now within its bound. Recheck immediately
-            // rather than waiting for another arrival or a recovery query.
-            if let Some((sn, sample)) = pop_next_ready_sample(state) {
-                deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
-            }
-        }
-    }
-}
-
-#[zenoh_macros::unstable]
-/// Find the next expected sequence number.
-///
-/// Skip only known abandoned or evicted samples. Before the first delivery,
-/// start at the first non-abandoned entry.
-fn next_expected_sn(state: &SourceState<WrappingSn>) -> Option<WrappingSn> {
-    let Some(last) = state.last_delivered else {
-        return state
-            .pending_samples
-            .iter()
-            .find(|(_, sample)| !sample.is_abandoned())
-            .map(|(sn, _)| *sn);
-    };
-    let mut next = last + 1;
-    if let Some(evicted) = state.last_evicted {
-        if evicted >= next {
-            next = evicted + 1;
-        }
-    }
-    while state
-        .pending_samples
-        .get(&next)
-        .is_some_and(FragmentedSample::is_abandoned)
-    {
-        next += 1;
-    }
-    Some(next)
-}
-
-#[zenoh_macros::unstable]
-/// Take the next complete sample eligible for delivery.
-///
-/// Stop at recoverable partials or unknown gaps. Tombstones remain until
-/// delivery retires them.
-fn pop_next_ready_sample(state: &mut SourceState<WrappingSn>) -> Option<(WrappingSn, Sample)> {
-    abandon_failed_barrier(state);
-    let sn = next_expected_sn(state)?;
-    remove_and_defrag(&mut state.pending_samples, sn).map(|sample| (sn, sample))
-}
-
-/// Abandon only the first unresolved assembly, after recovery failure, if a
-/// complete successor is waiting. Unknown gaps still require ordinary recovery.
-fn abandon_failed_barrier(state: &mut SourceState<WrappingSn>) {
-    loop {
-        let Some((&sn, sample)) = state
-            .pending_samples
-            .iter()
-            .find(|(_, sample)| !sample.is_abandoned())
-        else {
-            return;
-        };
-        if !sample.can_abandon()
-            || !state
-                .pending_samples
-                .range((std::ops::Bound::Excluded(sn), std::ops::Bound::Unbounded))
-                .any(|(_, sample)| sample.is_complete())
-        {
-            return;
-        }
-        // Do not abandon farther down the delivery path while an unknown gap
-        // or an earlier complete sample is still waiting to be processed.
-        if next_expected_sn(state).is_some_and(|next| sn > next)
-            && !state.pending_flush.is_some_and(|through| sn <= through)
-        {
-            return;
-        }
-        state
-            .pending_samples
-            .insert(sn, FragmentedSample::Abandoned);
-    }
-}
-
-#[zenoh_macros::unstable]
-fn remove_and_defrag<T>(
-    pending_samples: &mut BTreeMap<T, FragmentedSample>,
-    key: T,
-) -> Option<Sample>
-where
-    T: Ord,
-{
-    if let btree_map::Entry::Occupied(entry) = pending_samples.entry(key) {
-        if entry.get().is_complete() {
-            return Some(entry.remove().into_sample().unwrap());
-        }
-    }
-    None
-}
-
-#[zenoh_macros::unstable]
-fn deliver_and_flush(
-    sample: Sample,
-    source_sn: impl Into<WrappingSn>,
-    callback: &Callback<Sample>,
-    miss_handlers: &HashMap<usize, Callback<Miss>>,
-    source_id: EntityGlobalId,
-    state: &mut SourceState<WrappingSn>,
-) {
-    let mut ready = Some((source_sn.into(), sample));
-    while let Some((source_sn, sample)) = ready {
-        // Account for misses only on delivery, including abandoned samples
-        // passed by this delivery. Before the first delivery, gaps are unknown.
-        if let Some(last) = state.last_delivered {
-            if source_sn > last + 1 {
-                let missed = source_sn - last - 1;
-                tracing::info!("Sample missed: missed {missed} samples from {source_id:?}.");
-                for miss_callback in miss_handlers.values() {
-                    miss_callback.call(Miss {
-                        source: source_id,
-                        nb: missed,
-                    });
-                }
-            }
-        }
-        callback.call(sample);
-        state.last_delivered = Some(source_sn);
-        // The delivery watermark now protects these evicted entries. Keeping
-        // an older watermark indefinitely breaks WrappingSn half-range ordering.
-        if state
-            .last_evicted
-            .is_some_and(|evicted| source_sn >= evicted)
-        {
-            state.last_evicted = None;
-        }
-        // Remaining fragments at or before last_delivered are rejected as old.
-        while state
-            .pending_samples
-            .first_key_value()
-            .is_some_and(|(sn, _)| *sn <= source_sn)
-        {
-            state.pending_samples.pop_first();
-        }
-        ready = pop_next_ready_sample(state);
-    }
-    // Abort the recovery scan only once nothing is incomplete anymore: while
-    // any entry is incomplete the scan keeps recovering it. The next
-    // fragmented sample re-arms a scan via `arm_frag_recovery`.
-    if !state
-        .pending_samples
-        .values()
-        .any(FragmentedSample::is_incomplete)
-    {
-        state.frag_recovery_task = None;
-    }
-}
-
-/// A fragmented sample must carry `SourceInfo`: it is only produced by
-/// [`AdvancedPublisher`](crate::AdvancedPublisher) with
-/// [`sample_miss_detection`](crate::MissDetectionConfig) enabled, and the
-/// reassembly below keys partial slots by `(source_id, sequence number)`.
-/// See [`FragInfoBuilderTrait`].
+/// Without `SourceInfo`, we cannot tell which sample a fragment belongs to.
+/// The source ID and sequence number are needed to group fragments together.
 #[inline]
 fn is_orphan_fragment(sample: &Sample) -> bool {
     // TODO: update when timestamped sources are supported on fragmentation
     sample.source_info().is_none() && sample.frag_info().is_some()
 }
 
+/// Tells the publication callback whether to start recovery timers or queries.
+/// Query replies leave that work until the query finishes.
+#[derive(Default)]
+struct SampleInsertion {
+    new_source: bool,
+    new_fragment_slot: bool,
+}
+
 #[zenoh_macros::unstable]
-fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
+fn handle_sample(states: &mut State, sample: Sample) -> SampleInsertion {
     let Some(callback) = states.callback.as_ref() else {
-        return (false, false);
+        return SampleInsertion::default();
     };
     if is_orphan_fragment(&sample) {
         tracing::debug!(
@@ -1014,7 +714,7 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
              source_info. Fragments must originate from an AdvancedPublisher \
              with sample_miss_detection enabled."
         );
-        return (false, false);
+        return SampleInsertion::default();
     }
     if let Some(source_info) = sample.source_info().cloned() {
         let mut new_source = false;
@@ -1023,7 +723,7 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
         let is_fragmented = sample.frag_info().is_some();
         let global_pending_queries = states.global_pending_queries;
         let retransmission = states.retransmission;
-        let max_history_depth = states.max_history_depth;
+        let max_pending_samples = states.max_pending_samples;
         let max_fragments = states.max_fragments;
         let miss_handlers = &states.miss_handlers;
         let state = states.sequenced_states.get_or_insert_mut(source_id, || {
@@ -1037,40 +737,48 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
                 .get(&sn)
                 .is_some_and(FragmentedSample::is_abandoned)
         {
-            return (new_source, false);
+            return SampleInsertion {
+                new_source,
+                new_fragment_slot: false,
+            };
         }
 
         let new_frag = if state.last_delivered.is_none() && global_pending_queries != 0 {
             // Late joiner: buffer until the historical query completes.
             if is_fragmented {
-                match insert_fragment(state, sample, &source_info, max_fragments) {
+                match state.insert_sample(sample, &source_info, max_fragments) {
                     Ok(new_frag) => {
-                        maybe_evict_oldest(
-                            state,
+                        state.enforce_pending_limit(
                             callback,
                             miss_handlers,
                             source_id,
-                            max_history_depth,
+                            max_pending_samples,
                         );
                         new_frag
                     }
                     Err(()) => false,
                 }
-            } else if max_history_depth == 1 {
-                deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
+            } else if max_pending_samples == 1 {
+                state.deliver_and_drain(sample, sn, callback, miss_handlers, source_id);
                 false
             } else {
                 state
                     .pending_samples
                     .insert(sn, FragmentedSample::single(sample));
-                maybe_evict_oldest(state, callback, miss_handlers, source_id, max_history_depth);
+                state.enforce_pending_limit(
+                    callback,
+                    miss_handlers,
+                    source_id,
+                    max_pending_samples,
+                );
                 false
             }
         } else if state.last_delivered.is_some() && sn != state.last_delivered.unwrap() + 1 {
             if sn > state.last_delivered.unwrap() {
                 if retransmission {
                     let new_frag = if is_fragmented {
-                        insert_fragment(state, sample, &source_info, max_fragments)
+                        state
+                            .insert_sample(sample, &source_info, max_fragments)
                             .unwrap_or_default()
                     } else {
                         state
@@ -1079,33 +787,31 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
                         false
                     };
                     // A recovered fragment may close the gap; try to flush.
-                    if let Some((sn, s)) = pop_next_ready_sample(state) {
-                        deliver_and_flush(s, sn, callback, miss_handlers, source_id, state);
+                    if let Some((sn, s)) = state.pop_next_ready() {
+                        state.deliver_and_drain(s, sn, callback, miss_handlers, source_id);
                     }
-                    maybe_evict_oldest(
-                        state,
+                    state.enforce_pending_limit(
                         callback,
                         miss_handlers,
                         source_id,
-                        max_history_depth,
+                        max_pending_samples,
                     );
                     new_frag
                 } else {
                     if is_fragmented {
-                        let _ = insert_fragment(state, sample, &source_info, max_fragments);
-                        maybe_evict_oldest(
-                            state,
+                        let _ = state.insert_sample(sample, &source_info, max_fragments);
+                        state.enforce_pending_limit(
                             callback,
                             miss_handlers,
                             source_id,
-                            max_history_depth,
+                            max_pending_samples,
                         );
-                        if let Some(s) = remove_and_defrag(&mut state.pending_samples, sn) {
-                            deliver_and_flush(s, sn, callback, miss_handlers, source_id, state);
+                        if let Some(s) = state.take_complete(sn) {
+                            state.deliver_and_drain(s, sn, callback, miss_handlers, source_id);
                         }
                     } else {
-                        // Misses are reported by `deliver_and_flush` on delivery.
-                        deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
+                        // Misses are reported on delivery.
+                        state.deliver_and_drain(sample, sn, callback, miss_handlers, source_id);
                     }
                     false
                 }
@@ -1116,74 +822,78 @@ fn handle_sample(states: &mut State, sample: Sample) -> (bool, bool) {
         } else {
             // In-order sample, or a source with no delivery baseline yet.
             if is_fragmented {
-                match insert_fragment(state, sample, &source_info, max_fragments) {
+                match state.insert_sample(sample, &source_info, max_fragments) {
                     Ok(new_frag) => {
-                        maybe_evict_oldest(
-                            state,
+                        state.enforce_pending_limit(
                             callback,
                             miss_handlers,
                             source_id,
-                            max_history_depth,
+                            max_pending_samples,
                         );
                         let ready = if retransmission {
-                            pop_next_ready_sample(state)
+                            state.pop_next_ready()
                         } else {
-                            remove_and_defrag(&mut state.pending_samples, sn).map(|s| (sn, s))
+                            state.take_complete(sn).map(|s| (sn, s))
                         };
                         if let Some((k, s)) = ready {
-                            deliver_and_flush(s, k, callback, miss_handlers, source_id, state);
+                            state.deliver_and_drain(s, k, callback, miss_handlers, source_id);
                         }
                         new_frag
                     }
                     Err(()) => false,
                 }
             } else if retransmission && !state.pending_samples.is_empty() {
-                // An unfragmented first delivery must not bypass an earlier
-                // recoverable partial assembly either.
+                // Even a complete sample must wait if an earlier sample has
+                // missing fragments we can still recover.
                 state
                     .pending_samples
                     .insert(sn, FragmentedSample::single(sample));
-                maybe_evict_oldest(state, callback, miss_handlers, source_id, max_history_depth);
-                if let Some((sn, sample)) = pop_next_ready_sample(state) {
-                    deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
+                state.enforce_pending_limit(
+                    callback,
+                    miss_handlers,
+                    source_id,
+                    max_pending_samples,
+                );
+                if let Some((sn, sample)) = state.pop_next_ready() {
+                    state.deliver_and_drain(sample, sn, callback, miss_handlers, source_id);
                 }
                 false
             } else {
-                deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
+                state.deliver_and_drain(sample, sn, callback, miss_handlers, source_id);
                 false
             }
         };
 
         if global_pending_queries == 0 {
-            resume_sequenced_flush(state, callback, miss_handlers, source_id, retransmission);
+            state.drain_authorized_samples(callback, miss_handlers, source_id, retransmission);
         }
         state.latest_access = Instant::now();
-        (new_source, new_frag)
+        SampleInsertion {
+            new_source,
+            new_fragment_slot: new_frag,
+        }
     } else if let Some(timestamp) = sample.timestamp() {
         let state = states
             .timestamped_states
             .get_or_insert_mut(*timestamp.get_id(), Default::default);
         if state.last_delivered.map(|t| t < *timestamp).unwrap_or(true) {
             if (states.global_pending_queries == 0 && state.pending_queries == 0)
-                || states.max_history_depth == 1
+                || states.max_pending_samples == 1
             {
                 state.last_delivered = Some(*timestamp);
                 callback.call(sample);
             } else {
-                state
-                    .pending_samples
-                    .entry(*timestamp)
-                    .or_insert(FragmentedSample::single(sample));
-                if state.pending_samples.len() >= states.max_history_depth {
-                    flush_timestamped_source(state, Some(callback));
+                state.pending_samples.entry(*timestamp).or_insert(sample);
+                if state.pending_samples.len() >= states.max_pending_samples {
+                    state.flush(Some(callback));
                 }
             }
         }
         state.latest_access = Instant::now();
-        (false, false)
+        SampleInsertion::default()
     } else {
         callback.call(sample);
-        (false, false)
+        SampleInsertion::default()
     }
 }
 
@@ -1197,193 +907,25 @@ fn range(name: &str, start: Option<WrappingSn>, end: Option<WrappingSn>) -> Stri
     }
 }
 
-/// Query missing sequence numbers when recovery is enabled and no query is pending.
-/// Reserve the query under the state lock, then issue it after releasing the lock.
-fn recover_sequence_gap(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
-    let (session, key_expr, query_target, query_timeout, start) = {
-        let mut states = zlock!(statesref);
-        if !states.retransmission || states.callback.is_none() {
-            return;
-        }
-        // A queued recovery check must not recreate a removed source or keep
-        // an idle source alive merely by checking it.
-        let Some(state) = states.sequenced_states.peek_mut(&source_id) else {
-            return;
-        };
-        if state.last_delivered.is_none() {
-            return;
-        }
-        let start = next_expected_sn(state).unwrap();
-        // An incomplete entry at the next expected SN is handled by fragment
-        // recovery. Only a sequence-number gap requires a whole-sample query.
-        if state.pending_queries != 0
-            || state.pending_samples.is_empty()
-            || state
-                .pending_samples
-                .iter()
-                .find(|(_, s)| !s.is_abandoned())
-                .map(|(sn, _)| *sn)
-                .map_or(true, |sn| sn <= start)
-        {
-            return;
-        }
-        // Reserve the query atomically with the gap check: another live sample
-        // or fragment-query completion may concurrently request this check.
-        state.pending_queries += 1;
-        (
-            states.session.clone(),
-            states.key_expr.clone(),
-            states.query_target,
-            states.query_timeout,
-            start,
-        )
-    };
-    let query_expr = &key_expr
-        / KE_ADV_PREFIX
-        / KE_STAR
-        / &source_id.zid().into_keyexpr()
-        / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
-        / KE_STARSTAR;
-    let seq_num_range = range("_sn", Some(start), None);
-    tracing::trace!(
-        "AdvancedSubscriber{{key_expr: {}}}: Querying missing samples {}?{}",
-        key_expr,
-        query_expr,
-        seq_num_range
-    );
-    let handler = SequencedRepliesHandler {
-        source_id,
-        statesref: statesref.clone(),
-    };
-    // Local replies may run synchronously, so never issue the query while
-    // holding the subscriber state lock.
-    let _ = session
-        .get(Selector::from((query_expr, seq_num_range)))
-        .callback(move |r: Reply| {
-            if let Ok(s) = r.into_result() {
-                if key_expr.intersects(s.key_expr()) {
-                    let states = &mut *zlock!(handler.statesref);
-                    tracing::trace!(
-                        "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
-                        states.key_expr,
-                        s.source_info(),
-                        s.timestamp()
-                    );
-                    handle_sample(states, s);
-                }
-            }
-        })
-        .consolidation(ConsolidationMode::None)
-        .accept_replies(ReplyKeyExpr::Any)
-        .target(query_target)
-        .timeout(query_timeout)
-        .wait();
-}
-
-fn spawn_periodic_queries(
-    statesref: &Arc<Mutex<State>>,
-    period: Option<Duration>,
-    source_id: EntityGlobalId,
-) -> Option<AbortOnDropHandle<()>> {
-    let period = period?;
-    let statesref = statesref.clone();
-    Some(AbortOnDropHandle::new(ZRuntime::Application.spawn(
-        async move {
-            let mut interval = tokio::time::interval(period);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await; // interval first tick is immediate
-            loop {
-                interval.tick().await;
-                periodic_query(&statesref, source_id);
-            }
-        },
-    )))
-}
-
-fn periodic_query(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
-    let mut guard = statesref.lock().unwrap();
-    let states = &mut *guard;
-    // Initial/history queries already retrieve these samples.
-    if states.global_pending_queries != 0 {
-        return;
-    }
-    // use peek_mut so query without samples do not prevent the state to be garbage collected
-    let Some(state) = states.sequenced_states.peek_mut(&source_id) else {
-        return;
-    };
-    // Coalesce ticks while ordinary queries or fragment recovery are pending,
-    // allowing their completion to bring the counter to zero and flush gaps.
-    if state.pending_queries != 0 {
-        return;
-    }
-    state.pending_queries += 1;
-    let query_expr = &states.key_expr
-        / KE_ADV_PREFIX
-        / KE_STAR
-        / &source_id.zid().into_keyexpr()
-        / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
-        / KE_STARSTAR;
-    let seq_num_range = range("_sn", state.last_delivered.map(|s| s + 1), None);
-
-    let session = states.session.clone();
-    let key_expr = states.key_expr.clone().into_owned();
-    let query_target = states.query_target;
-    let query_timeout = states.query_timeout;
-
-    tracing::trace!(
-        "AdvancedSubscriber{{key_expr: {}}}: Querying undelivered samples {}?{}",
-        states.key_expr,
-        query_expr,
-        seq_num_range
-    );
-    drop(guard);
-
-    let handler = SequencedRepliesHandler {
-        source_id,
-        statesref: statesref.clone(),
-    };
-    let _ = session
-        .get(Selector::from((query_expr, seq_num_range)))
-        .callback({
-            move |r: Reply| {
-                if let Ok(s) = r.into_result() {
-                    if key_expr.intersects(s.key_expr()) {
-                        let states = &mut *zlock!(handler.statesref);
-                        tracing::trace!(
-                            "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
-                            states.key_expr,
-                            s.source_info(),
-                            s.timestamp()
-                        );
-                        handle_sample(states, s);
-                    }
-                }
-            }
-        })
-        .consolidation(ConsolidationMode::None)
-        .accept_replies(ReplyKeyExpr::Any)
-        .target(query_target)
-        .timeout(query_timeout)
-        .wait();
-}
-
 /// Garbage collects the source states' lists.
 ///
-/// Reclamation is based on `SourceState::latest_access`; alive publishers are not reclaimed.
+/// Reclamation is based on last access; alive publishers are not reclaimed.
 async fn gc_task(statesref: Weak<Mutex<State>>, retention_period: Duration) {
     /// Garbage collect a lists and return the oldest access.
-    fn garbage_collect<K: Copy + Eq + Hash, T>(
-        states: &mut LruCache<K, SourceState<T>>,
+    fn garbage_collect<K: Copy + Eq + Hash, S>(
+        states: &mut LruCache<K, S>,
         retention_period: Duration,
         now: Instant,
+        retention: impl Fn(&mut S) -> (&mut Instant, bool),
     ) -> Instant {
-        while let Some((&key, state)) = states.peek_lru() {
-            if now.duration_since(state.latest_access) <= retention_period {
-                return state.latest_access;
+        while let Some((&key, state)) = states.iter_mut().next_back() {
+            let (latest_access, alive) = retention(state);
+            if now.duration_since(*latest_access) <= retention_period {
+                return *latest_access;
             // if the publisher is still marked as alive, just update its latest access
             // (accessing the state will also move it to the back of the LRU list)
-            } else if state.alive {
-                states.get_mut(&key).unwrap().latest_access = now;
+            } else if alive {
+                *retention(states.get_mut(&key).unwrap()).0 = now;
             } else {
                 states.pop_lru();
             }
@@ -1404,270 +946,15 @@ async fn gc_task(statesref: Weak<Mutex<State>>, retention_period: Duration) {
             let mut states = states.lock().unwrap();
             let now = Instant::now();
             min(
-                garbage_collect(&mut states.sequenced_states, retention_period, now),
-                garbage_collect(&mut states.timestamped_states, retention_period, now),
+                garbage_collect(&mut states.sequenced_states, retention_period, now, |s| {
+                    (&mut s.latest_access, s.alive)
+                }),
+                garbage_collect(&mut states.timestamped_states, retention_period, now, |s| {
+                    (&mut s.latest_access, s.alive)
+                }),
             )
         };
         tokio::time::sleep_until((oldest_access + retention_period).into()).await;
-    }
-}
-
-/// Arm the recurring fragment-recovery scan of a source unless one is already
-/// running. The scan recovers the missing fragments of every incomplete
-/// sample of the source, so it is never tied to a single sample.
-fn arm_frag_recovery(
-    statesref: &Arc<Mutex<State>>,
-    key_expr: &KeyExpr<'static>,
-    state: &mut SourceState<WrappingSn>,
-    source_id: EntityGlobalId,
-    delay: Duration,
-) {
-    if state
-        .frag_recovery_task
-        .as_ref()
-        .is_some_and(|h| !h.is_finished())
-    {
-        return;
-    }
-    state.frag_recovery_task = Some(spawn_frag_recovery(
-        statesref.clone(),
-        key_expr.clone(),
-        source_id,
-        state.generation.clone(),
-        delay,
-    ));
-}
-
-/// Run fragment recovery for the slot of the fragment that was just inserted
-/// via [`handle_sample`] (must be called with the state lock held, right
-/// after the insertion).
-///
-/// - Arms the recurring fragment-recovery scan when the insertion created a
-///   new sequence-number slot.
-/// - Queries holes immediately unless this sample already has an outstanding
-///   attempt. The scan handles new holes and stalled tails after that attempt.
-///
-/// Each attempt reserves one `pending_queries` count, released only after all
-/// its range queries finish. Failure remains retryable unless delivery needs
-/// to advance to a complete successor.
-fn frag_recovery_on_fragment(
-    statesref: &Arc<Mutex<State>>,
-    key_expr: &KeyExpr<'static>,
-    state: &mut SourceState<WrappingSn>,
-    source_id: EntityGlobalId,
-    sn: WrappingSn,
-    new_frag: bool,
-    delay: Duration,
-) {
-    if new_frag {
-        arm_frag_recovery(statesref, key_expr, state, source_id, delay);
-    }
-    let Some(sample) = state.pending_samples.get_mut(&sn) else {
-        return;
-    };
-    if state.pending_queries != 0 && sample.is_retry() {
-        return;
-    }
-    let holes = sample.missing_holes();
-    if holes.is_empty() {
-        return;
-    }
-    let Some(attempt) = sample.begin_recovery(delay) else {
-        return;
-    };
-    state.pending_queries += 1;
-    let generation = state.generation.clone();
-    let statesref = statesref.clone();
-    let key_expr = key_expr.clone();
-    // TODO: handle cancellation of tasks
-    ZRuntime::Application.spawn(async move {
-        issue_frag_recovery_queries(
-            statesref,
-            key_expr,
-            source_id,
-            generation,
-            vec![(sn, holes, attempt)],
-        )
-        .await;
-    });
-}
-
-/// Spawn the recurring fragment-recovery scan of a source.
-///
-/// Every `delay`, the scan snapshots the missing fragments of all incomplete
-/// samples of the source and issues one `session.get` per missing range,
-/// replies being inserted via [`handle_sample`]. Two kinds of ranges are
-/// distinguished:
-/// * *holes* — closed ranges bounded by received fragments on both sides
-///   (e.g. fragment 2 in a sample whose fragments 0, 1 and 3 arrived) — are
-///   queried unless this sample already has an outstanding attempt.
-/// * the *tail* — the open-ended range following the highest received
-///   fragment (e.g. fragments 4.. in a sample whose fragments 0..3 arrived)
-///   — is only queried once no previously missing fragment arrived for `delay`:
-///   it is normally filled by the sequential arrival of the remaining
-///   fragments, and querying it in-flight would be wasted. Duplicates do not
-///   postpone this recovery.
-///
-/// The scan exits at the first tick finding no recoverable incomplete sample;
-/// [`arm_frag_recovery`] re-arms it when a new fragmented sample arrives.
-///
-/// Each sample reserves one outstanding attempt atomically with its ranges.
-/// An unsuccessful attempt enforces a cooldown of `delay` before retrying.
-/// Only failures blocking complete successors become terminal tombstones.
-fn spawn_frag_recovery(
-    statesref: Arc<Mutex<State>>,
-    key_expr: KeyExpr<'static>,
-    source_id: EntityGlobalId,
-    generation: Arc<()>,
-    delay: Duration,
-) -> AbortOnDropHandle<()> {
-    AbortOnDropHandle::new(ZRuntime::Application.spawn(async move {
-        let mut interval = tokio::time::interval(delay);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await; // the first tick is immediate: discard it
-        loop {
-            interval.tick().await;
-            let missing = {
-                let mut lock = zlock!(statesref);
-                let states = &mut *lock;
-                let Some(state) = states.sequenced_states.get_mut(&source_id) else {
-                    return;
-                };
-                if !Arc::ptr_eq(&state.generation, &generation) {
-                    return;
-                }
-                let mut missing: MissingFrags = Vec::new();
-                let queries_pending = state.pending_queries != 0;
-                for (sn, frags) in state.pending_samples.iter_mut() {
-                    // A retry must not replenish the counter while other
-                    // queries are finishing and need to flush buffered data.
-                    if queries_pending && frags.is_retry() {
-                        continue;
-                    }
-                    let mut ranges = frags.missing_holes();
-                    // Only query the tail once the sequential stream it is
-                    // expected from looks stalled.
-                    if let Some(tail) = frags.missing_tail(delay) {
-                        ranges.push(tail);
-                    }
-                    if !ranges.is_empty() {
-                        if let Some(attempt) = frags.begin_recovery(delay) {
-                            missing.push((*sn, ranges, attempt));
-                        }
-                    }
-                }
-                // Exit only once no sample is incomplete anymore, tail
-                // included: a sample whose tail has not been queried yet (its
-                // stream was still active) must keep the scan alive so the
-                // tail is recovered if the stream stalls.
-                if !state
-                    .pending_samples
-                    .values()
-                    .any(FragmentedSample::is_incomplete)
-                {
-                    return;
-                }
-                state.pending_queries += missing.len() as u64;
-                missing
-            };
-            if missing.is_empty() {
-                continue;
-            }
-            issue_frag_recovery_queries(
-                statesref.clone(),
-                key_expr.clone(),
-                source_id,
-                generation.clone(),
-                missing,
-            )
-            .await;
-        }
-    }))
-}
-
-/// Issue one `session.get` per `(sn, missing-range)` pair of `missing`,
-/// replies being inserted via [`handle_sample`].
-///
-/// The caller reserves one `pending_queries` count per sample. All range queries
-/// of that sample share a handler, so its completion evaluates the whole attempt.
-async fn issue_frag_recovery_queries(
-    statesref: Arc<Mutex<State>>,
-    key_expr: KeyExpr<'static>,
-    source_id: EntityGlobalId,
-    generation: Arc<()>,
-    missing: MissingFrags,
-) {
-    let (session, query_target, query_timeout) = {
-        let states = &mut *zlock!(statesref);
-        (
-            states.session.clone(),
-            states.query_target,
-            states.query_timeout,
-        )
-    };
-    let query_expr = key_expr.clone()
-        / KE_ADV_PREFIX
-        / KE_STAR
-        / &source_id.zid().into_keyexpr()
-        / &KeyExpr::try_from(source_id.eid().to_string()).unwrap()
-        / KE_STARSTAR;
-    for (sn, ranges, attempt) in missing {
-        let handler = Arc::new(FragRecoveryRepliesHandler {
-            source_id,
-            statesref: statesref.clone(),
-            generation: generation.clone(),
-            sn,
-            ranges: ranges.clone(),
-            attempt,
-        });
-        let seq_num_range = range("_sn", Some(sn), Some(sn));
-        for missing_range in ranges {
-            let frags_range = range(
-                "_fn",
-                missing_range.0.map(Into::into),
-                missing_range.1.map(Into::into),
-            );
-            let _ = session
-                .get(Selector::from((
-                    query_expr.clone(),
-                    seq_num_range.clone() + ";" + &frags_range,
-                )))
-                .callback({
-                    let handler = handler.clone();
-                    let key_expr = key_expr.clone().into_owned();
-                    let statesref = statesref.clone();
-                    move |r: Reply| {
-                        if let Ok(s) = r.into_result() {
-                            if key_expr.intersects(s.key_expr())
-                                && s.source_info().is_some_and(|info| {
-                                    *info.source_id() == source_id
-                                        && WrappingSn::from(info.source_sn()) == sn
-                                })
-                            {
-                                let states = &mut *zlock!(statesref);
-                                let current =
-                                    states
-                                        .sequenced_states
-                                        .peek(&source_id)
-                                        .is_some_and(|state| {
-                                            Arc::ptr_eq(&state.generation, &handler.generation)
-                                                && state.pending_samples.get(&sn).is_some_and(|s| {
-                                                    s.recovery_matches(&handler.attempt)
-                                                })
-                                        });
-                                if current {
-                                    handle_sample(states, s);
-                                }
-                            }
-                        }
-                    }
-                })
-                .consolidation(ConsolidationMode::None)
-                .accept_replies(ReplyKeyExpr::Any)
-                .target(query_target)
-                .timeout(query_timeout)
-                .wait();
-        }
     }
 }
 
@@ -1706,9 +993,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
             None => None,
         };
         let retransmission = conf.retransmission;
-        let query_target = conf.query_target;
-        let query_timeout = conf.query_timeout;
-        let max_history_depth = conf
+        let max_pending_samples = conf
             .max_pending_samples
             .or(conf.history.as_ref().and_then(|h| h.max_samples))
             .unwrap_or(DEFAULT_MAX_PENDING_SAMPLES);
@@ -1727,7 +1012,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                 key_expr: key_expr.clone().into_owned(),
                 retransmission: retransmission.is_some(),
                 frag_recovery_delay: retransmission.unwrap_or_default().frag_recovery_delay,
-                max_history_depth,
+                max_pending_samples,
                 query_target: conf.query_target,
                 query_timeout: conf.query_timeout,
                 max_fragments: conf.max_fragments,
@@ -1742,44 +1027,53 @@ impl<Handler> AdvancedSubscriber<Handler> {
 
         let sub_callback = {
             let statesref = statesref.clone();
-            let key_expr = key_expr.clone().into_owned();
 
             move |s: Sample| {
                 let mut lock = zlock!(statesref);
                 let states = &mut *lock;
                 let source_info = s.source_info().cloned();
                 let is_fragmented = s.frag_info().is_some();
-                let (new_source, new_frag) = handle_sample(states, s);
-
-                if is_fragmented {
-                    if let Some(reconf) = retransmission {
-                        if let Some(source_info) = source_info.as_ref() {
-                            let source_id = *source_info.source_id();
-                            if let Some(state) = states.sequenced_states.get_mut(&source_id) {
-                                frag_recovery_on_fragment(
-                                    &statesref,
-                                    &key_expr,
-                                    state,
-                                    source_id,
-                                    source_info.source_sn().into(),
-                                    new_frag,
-                                    reconf.frag_recovery_delay,
-                                );
-                            }
-                        }
-                    }
+                let inserted = handle_sample(states, s);
+                let Some(info) = source_info else {
+                    return;
+                };
+                let source_id = *info.source_id();
+                let Some(state) = states.sequenced_states.get_mut(&source_id) else {
+                    return;
+                };
+                let request = if is_fragmented {
+                    retransmission.and_then(|conf| {
+                        state.on_fragment(
+                            &statesref,
+                            source_id,
+                            info.source_sn().into(),
+                            inserted.new_fragment_slot,
+                            conf.frag_recovery_delay,
+                        )
+                    })
+                } else {
+                    None
+                };
+                if inserted.new_source {
+                    state.periodic_task = SequencedRepliesHandler::spawn_periodic(
+                        &statesref,
+                        states.period,
+                        source_id,
+                    );
                 }
-
-                if let Some(source_id) = source_info.as_ref().map(|si| *si.source_id()) {
-                    if let Some(state) = states.sequenced_states.get_mut(&source_id) {
-                        if new_source {
-                            state.periodic_task =
-                                spawn_periodic_queries(&statesref, states.period, source_id);
-                        }
-                    }
-                    drop(lock);
-                    recover_sequence_gap(&statesref, source_id);
+                let work = request.map(|request| (request, state.generation.clone()));
+                let work = work
+                    .map(|(request, generation)| (request, generation, QueryContext::new(states)));
+                drop(lock);
+                if let Some((request, generation, context)) = work {
+                    ZRuntime::Application.spawn(context.fragment_query_task(
+                        &statesref,
+                        source_id,
+                        &generation,
+                        request,
+                    ));
                 }
+                SequencedRepliesHandler::recover_gap(&statesref, source_id);
             }
         };
 
@@ -1810,58 +1104,21 @@ impl<Handler> AdvancedSubscriber<Handler> {
             let handler = InitialRepliesHandler {
                 statesref: statesref.clone(),
             };
-            let mut params = Parameters::empty();
-            if let Some(max) = historyconf.max_samples {
-                params.insert("_max", max.to_string());
-            }
-            if let Some(age) = historyconf.max_age {
-                params.set_time_range(TimeRange {
-                    start: TimeBound::Inclusive(TimeExpr::Now { offset_secs: -age }),
-                    end: TimeBound::Unbounded,
-                });
-            }
-            tracing::trace!(
-                "AdvancedSubscriber{{key_expr: {}}} Querying historical samples {}?{}",
-                key_expr,
-                &key_expr / KE_ADV_PREFIX / KE_STARSTAR,
-                params
-            );
-            let _ = conf
-                .session
-                .get(Selector::from((
+            let context = QueryContext::new(&zlock!(statesref));
+            handler.issue(
+                &context,
+                Selector::from((
                     &key_expr / KE_ADV_PREFIX / KE_STARSTAR,
-                    params,
-                )))
-                .callback({
-                    let key_expr = key_expr.clone().into_owned();
-                    move |r: Reply| {
-                        if let Ok(s) = r.into_result() {
-                            if key_expr.intersects(s.key_expr()) {
-                                let states = &mut *zlock!(handler.statesref);
-                                tracing::trace!(
-                                    "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
-                                    states.key_expr,
-                                    s.source_info(),
-                                    s.timestamp()
-                                );
-                                handle_sample(states, s);
-                            }
-                        }
-                    }
-                })
-                .consolidation(ConsolidationMode::None)
-                .accept_replies(ReplyKeyExpr::Any)
-                .target(query_target)
-                .timeout(query_timeout)
-                .wait();
+                    historyconf.parameters(),
+                )),
+            );
         }
 
         let liveliness_subscriber = if let Some(historyconf) = conf.history.as_ref() {
             if historyconf.liveliness {
                 let live_callback = {
-                    let session = conf.session.downgrade();
+                    let context = QueryContext::new(&zlock!(statesref));
                     let statesref = statesref.clone();
-                    let key_expr = key_expr.clone().into_owned();
                     let historyconf = historyconf.clone();
                     move |s: Sample| {
                         let Ok(parsed) = ke_liveliness::parse(s.key_expr().as_keyexpr()) else {
@@ -1902,50 +1159,16 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                 state.alive = true;
                                 state.latest_access = Instant::now();
 
-                                let mut params = Parameters::empty();
-                                if let Some(max) = historyconf.max_samples {
-                                    params.insert("_max", max.to_string());
-                                }
-                                if let Some(age) = historyconf.max_age {
-                                    params.set_time_range(TimeRange {
-                                        start: TimeBound::Inclusive(TimeExpr::Now {
-                                            offset_secs: -age,
-                                        }),
-                                        end: TimeBound::Unbounded,
-                                    });
-                                }
-                                tracing::trace!(
-                                    "AdvancedSubscriber{{key_expr: {}}}: Querying historical samples {}?{}",
-                                    states.key_expr,
-                                    s.key_expr(),
-                                    params
-                                );
                                 drop(lock);
 
                                 let handler = TimestampedRepliesHandler {
                                     id: ID::from(zid),
                                     statesref: statesref.clone(),
                                 };
-                                let _ = session
-                                    .get(Selector::from((s.key_expr(), params)))
-                                    .callback({
-                                        let key_expr = key_expr.clone().into_owned();
-                                        move |r: Reply| {
-                                            if let Ok(s) = r.into_result() {
-                                                if key_expr.intersects(s.key_expr()) {
-                                                    let states =
-                                                        &mut *zlock!(handler.statesref);
-                                                    tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                    handle_sample(states, s);
-                                                }
-                                            }
-                                        }
-                                    })
-                                    .consolidation(ConsolidationMode::None)
-                                    .accept_replies(ReplyKeyExpr::Any)
-                                    .target(query_target)
-                                    .timeout(query_timeout)
-                                    .wait();
+                                handler.issue(
+                                    &context,
+                                    Selector::from((s.key_expr(), historyconf.parameters())),
+                                );
                             } else if let Ok(eid) = EntityId::from_str(parsed.eid().as_str()) {
                                 let source_id = EntityGlobalId::new(zid, eid);
                                 let mut lock = zlock!(statesref);
@@ -1975,7 +1198,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                         Default::default()
                                     });
                                 if new {
-                                    state.periodic_task = spawn_periodic_queries(
+                                    state.periodic_task = SequencedRepliesHandler::spawn_periodic(
                                         &statesref,
                                         states.period,
                                         source_id,
@@ -1985,49 +1208,16 @@ impl<Handler> AdvancedSubscriber<Handler> {
                                 state.alive = true;
                                 state.latest_access = Instant::now();
 
-                                let mut params = Parameters::empty();
-                                if let Some(max) = historyconf.max_samples {
-                                    params.insert("_max", max.to_string());
-                                }
-                                if let Some(age) = historyconf.max_age {
-                                    params.set_time_range(TimeRange {
-                                        start: TimeBound::Inclusive(TimeExpr::Now {
-                                            offset_secs: -age,
-                                        }),
-                                        end: TimeBound::Unbounded,
-                                    });
-                                }
-                                tracing::trace!(
-                                    "AdvancedSubscriber{{key_expr: {}}}: Querying historical samples {}?{}",
-                                    states.key_expr,
-                                    s.key_expr(),
-                                    params,
-                                );
                                 drop(lock);
 
                                 let handler = SequencedRepliesHandler {
                                     source_id,
                                     statesref: statesref.clone(),
                                 };
-                                let _ = session
-                                    .get(Selector::from((s.key_expr(), params)))
-                                    .callback({
-                                        let key_expr = key_expr.clone().into_owned();
-                                        move |r: Reply| {
-                                            if let Ok(s) = r.into_result() {
-                                                if key_expr.intersects(s.key_expr()) {
-                                                    let states = &mut *zlock!(handler.statesref);
-                                                    tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                    handle_sample(states, s);
-                                                }
-                                            }
-                                        }
-                                    })
-                                    .consolidation(ConsolidationMode::None)
-                                    .accept_replies(ReplyKeyExpr::Any)
-                                    .target(query_target)
-                                    .timeout(query_timeout)
-                                    .wait();
+                                handler.issue(
+                                    &context,
+                                    Selector::from((s.key_expr(), historyconf.parameters())),
+                                );
                             }
                         } else if s.kind() == SampleKind::Put {
                             let mut lock = zlock!(statesref);
@@ -2039,48 +1229,15 @@ impl<Handler> AdvancedSubscriber<Handler> {
                             );
                             states.global_pending_queries += 1;
 
-                            let mut params = Parameters::empty();
-                            if let Some(max) = historyconf.max_samples {
-                                params.insert("_max", max.to_string());
-                            }
-                            if let Some(age) = historyconf.max_age {
-                                params.set_time_range(TimeRange {
-                                    start: TimeBound::Inclusive(TimeExpr::Now {
-                                        offset_secs: -age,
-                                    }),
-                                    end: TimeBound::Unbounded,
-                                });
-                            }
-                            tracing::trace!(
-                                "AdvancedSubscriber{{key_expr: {}}}: Querying historical samples {}?{}",
-                                states.key_expr,
-                                s.key_expr(),
-                                params,
-                            );
                             drop(lock);
 
                             let handler = InitialRepliesHandler {
                                 statesref: statesref.clone(),
                             };
-                            let _ = session
-                                .get(Selector::from((s.key_expr(), params)))
-                                .callback({
-                                    let key_expr = key_expr.clone().into_owned();
-                                    move |r: Reply| {
-                                        if let Ok(s) = r.into_result() {
-                                            if key_expr.intersects(s.key_expr()) {
-                                                let states = &mut *zlock!(handler.statesref);
-                                                tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                                handle_sample(states, s);
-                                            }
-                                        }
-                                    }
-                                })
-                                .consolidation(ConsolidationMode::None)
-                                .accept_replies(ReplyKeyExpr::Any)
-                                .target(query_target)
-                                .timeout(query_timeout)
-                                .wait();
+                            handler.issue(
+                                &context,
+                                Selector::from((s.key_expr(), historyconf.parameters())),
+                            );
                         }
                     }
                 };
@@ -2154,7 +1311,7 @@ impl<Handler> AdvancedSubscriber<Handler> {
                     state.latest_access = Instant::now();
                     if new {
                         // NOTE: API does not allow both heartbeat and periodic_queries
-                        state.periodic_task = spawn_periodic_queries(&statesref, states.period, source_id);
+                        state.periodic_task = SequencedRepliesHandler::spawn_periodic(&statesref, states.period, source_id);
                         if states.global_pending_queries > 0 {
                             tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Skipping heartbeat on '{}' from publisher that is currently being pulled by global query", states.key_expr, heartbeat_keyexpr);
                             return;
@@ -2172,37 +1329,15 @@ impl<Handler> AdvancedSubscriber<Handler> {
                             Some(heartbeat_sn),
                         );
 
-                        let session = states.session.clone();
-                        let key_expr = states.key_expr.clone().into_owned();
-                        let query_target = states.query_target;
-                        let query_timeout = states.query_timeout;
                         state.pending_queries += 1;
-
-                        tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Querying missing samples {}?{}", states.key_expr, heartbeat_keyexpr, seq_num_range);
+                        let context = QueryContext::new(states);
                         drop(lock);
 
                         let handler = SequencedRepliesHandler {
                             source_id,
                             statesref: statesref.clone(),
                         };
-                        let _ = session
-                            .get(Selector::from((heartbeat_keyexpr, seq_num_range)))
-                            .callback({
-                                move |r: Reply| {
-                                    if let Ok(s) = r.into_result() {
-                                        if key_expr.intersects(s.key_expr()) {
-                                            let states = &mut *zlock!(handler.statesref);
-                                            tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}", states.key_expr, s.source_info(), s.timestamp());
-                                            handle_sample(states, s);
-                                        }
-                                    }
-                                }
-                            })
-                            .consolidation(ConsolidationMode::None)
-                            .accept_replies(ReplyKeyExpr::Any)
-                            .target(query_target)
-                            .timeout(query_timeout)
-                            .wait();
+                        handler.issue(&context, Selector::from((heartbeat_keyexpr, seq_num_range)));
                     }
                 })
                 .allowed_origin(conf.origin)
@@ -2324,288 +1459,6 @@ impl<Handler> AdvancedSubscriber<Handler> {
     #[zenoh_macros::internal]
     pub fn set_background(&mut self, background: bool) {
         self.set_background_impl(background)
-    }
-}
-
-#[zenoh_macros::unstable]
-#[inline]
-fn resume_sequenced_flush(
-    state: &mut SourceState<WrappingSn>,
-    callback: &Callback<Sample>,
-    miss_handlers: &HashMap<usize, Callback<Miss>>,
-    source_id: EntityGlobalId,
-    retransmission: bool,
-) {
-    if state.pending_queries != 0 {
-        return;
-    }
-    let Some(through) = state.pending_flush else {
-        return;
-    };
-    loop {
-        if retransmission {
-            abandon_failed_barrier(state);
-        }
-        if state.last_delivered.is_some_and(|last| last >= through)
-            || state.last_evicted.is_some_and(|last| last >= through)
-        {
-            state.pending_flush = None;
-            return;
-        }
-        // Keep tombstones until delivery retires them; removing one before a
-        // partial barrier would allow late fragments to resurrect abandonment.
-        let Some((&sn, sample)) = state
-            .pending_samples
-            .iter()
-            .find(|(sn, sample)| **sn <= through && !sample.is_abandoned())
-        else {
-            state.pending_flush = None;
-            return;
-        };
-        if retransmission && sample.is_incomplete() {
-            return;
-        }
-        let sample = state.pending_samples.remove(&sn).unwrap();
-        if let Some(sample) = sample.into_sample() {
-            if state.last_delivered.map_or(true, |last| sn > last) {
-                deliver_and_flush(sample, sn, callback, miss_handlers, source_id, state);
-            }
-        }
-    }
-}
-
-#[zenoh_macros::unstable]
-#[inline]
-fn flush_sequenced_source(
-    statesref: &Arc<Mutex<State>>,
-    states: &mut State,
-    source_id: &EntityGlobalId,
-) {
-    let Some(callback) = states.callback.as_ref() else {
-        return;
-    };
-    let Some(state) = states.sequenced_states.peek_mut(source_id) else {
-        return;
-    };
-    // An ordinary query permits advancement across absent sequence numbers,
-    // but only through the complete samples currently buffered. Recoverable
-    // partials remain barriers even if complete successors exist.
-    let last_complete = state
-        .pending_samples
-        .iter()
-        .rev()
-        .find_map(|(sn, sample)| sample.is_complete().then_some(*sn));
-    match (state.pending_flush, last_complete) {
-        (Some(old), Some(new)) => {
-            state.pending_flush = Some(old.max(new));
-        }
-        (_, Some(sn)) => state.pending_flush = Some(sn),
-        _ => {}
-    }
-    resume_sequenced_flush(
-        state,
-        callback,
-        &states.miss_handlers,
-        *source_id,
-        states.retransmission,
-    );
-    // Query replies may be the only fragments received for these assemblies,
-    // so no live callback necessarily armed their recovery scan.
-    if states.retransmission
-        && state
-            .pending_samples
-            .values()
-            .any(FragmentedSample::is_incomplete)
-    {
-        arm_frag_recovery(
-            statesref,
-            &states.key_expr,
-            state,
-            *source_id,
-            states.frag_recovery_delay,
-        );
-    }
-}
-
-#[zenoh_macros::unstable]
-#[inline]
-fn flush_timestamped_source(
-    state: &mut SourceState<Timestamp>,
-    callback: Option<&Callback<Sample>>,
-) {
-    let Some(callback) = callback else {
-        return;
-    };
-    if state.pending_queries == 0 && !state.pending_samples.is_empty() {
-        for (timestamp, frag_sample) in std::mem::take(&mut state.pending_samples) {
-            if let Some(sample) = frag_sample.into_sample() {
-                if state
-                    .last_delivered
-                    .map(|last| timestamp > last)
-                    .unwrap_or(true)
-                {
-                    state.last_delivered = Some(timestamp);
-                    callback.call(sample);
-                }
-            }
-        }
-    }
-}
-
-#[zenoh_macros::unstable]
-#[derive(Clone)]
-struct InitialRepliesHandler {
-    statesref: Arc<Mutex<State>>,
-}
-
-#[zenoh_macros::unstable]
-impl Drop for InitialRepliesHandler {
-    fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        states.global_pending_queries = states.global_pending_queries.saturating_sub(1);
-        tracing::trace!(
-            "AdvancedSubscriber{{key_expr: {}}}: Flush initial replies",
-            states.key_expr
-        );
-
-        if states.global_pending_queries == 0 {
-            let source_ids: Vec<_> = states.sequenced_states.iter().map(|(id, _)| *id).collect();
-            for source_id in source_ids {
-                flush_sequenced_source(&self.statesref, states, &source_id);
-                let state = states.sequenced_states.peek_mut(&source_id).unwrap();
-                state.periodic_task =
-                    spawn_periodic_queries(&self.statesref, states.period, source_id);
-            }
-            for (_, state) in states.timestamped_states.iter_mut() {
-                flush_timestamped_source(state, states.callback.as_ref());
-            }
-        }
-    }
-}
-
-#[zenoh_macros::unstable]
-#[derive(Clone)]
-struct SequencedRepliesHandler {
-    source_id: EntityGlobalId,
-    statesref: Arc<Mutex<State>>,
-}
-
-#[zenoh_macros::unstable]
-impl Drop for SequencedRepliesHandler {
-    fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        // use peek_mut so query without samples do not prevent the state to be garbage collected
-        if let Some(state) = states.sequenced_states.peek_mut(&self.source_id) {
-            state.pending_queries = state.pending_queries.saturating_sub(1);
-            if states.global_pending_queries == 0 {
-                tracing::trace!(
-                    "AdvancedSubscriber{{key_expr: {}}}: Flush sequenced samples",
-                    states.key_expr
-                );
-                flush_sequenced_source(&self.statesref, states, &self.source_id)
-            }
-        }
-    }
-}
-
-/// Reply handler for fragment-recovery queries.
-///
-/// Shared by every range query of one sample's recovery attempt. On completion,
-/// record a provisional failure if requested fragments are still missing.
-/// Abandon a failed barrier only when a complete successor is waiting.
-///
-/// Release ready successors without passing other recoverable partials.
-/// Unknown gaps may be passed only within an ordinary query's captured flush
-/// boundary; fragment recovery alone never grants permission to skip them.
-#[zenoh_macros::unstable]
-struct FragRecoveryRepliesHandler {
-    source_id: EntityGlobalId,
-    statesref: Arc<Mutex<State>>,
-    generation: Arc<()>,
-    sn: WrappingSn,
-    ranges: Vec<FragRange>,
-    attempt: Arc<()>,
-}
-
-#[zenoh_macros::unstable]
-impl Drop for FragRecoveryRepliesHandler {
-    fn drop(&mut self) {
-        let should_recheck = {
-            let states = &mut *zlock!(self.statesref);
-            // Queries without samples must not prevent garbage collection.
-            let Some(state) = states.sequenced_states.peek_mut(&self.source_id) else {
-                return;
-            };
-            if !Arc::ptr_eq(&state.generation, &self.generation) {
-                return;
-            }
-            state.pending_queries = state.pending_queries.saturating_sub(1);
-            if let Some(sample) = state.pending_samples.get_mut(&self.sn) {
-                sample.finish_recovery(&self.attempt, &self.ranges);
-            }
-            if states.global_pending_queries == 0 {
-                abandon_failed_barrier(state);
-            }
-            let last_query = state.pending_queries == 0;
-            if last_query && states.global_pending_queries == 0 {
-                if let Some(callback) = states.callback.as_ref() {
-                    resume_sequenced_flush(
-                        state,
-                        callback,
-                        &states.miss_handlers,
-                        self.source_id,
-                        states.retransmission,
-                    );
-                    if let Some((sn, sample)) = pop_next_ready_sample(state) {
-                        deliver_and_flush(
-                            sample,
-                            sn,
-                            callback,
-                            &states.miss_handlers,
-                            self.source_id,
-                            state,
-                        );
-                    }
-                }
-            }
-            last_query
-        };
-        if should_recheck {
-            let statesref = Arc::downgrade(&self.statesref);
-            let source_id = self.source_id;
-            // Do not issue another query recursively from a query callback's
-            // destructor. The helper rechecks current state before reserving it.
-            ZRuntime::Application.spawn(async move {
-                if let Some(statesref) = statesref.upgrade() {
-                    recover_sequence_gap(&statesref, source_id);
-                }
-            });
-        }
-    }
-}
-
-#[zenoh_macros::unstable]
-#[derive(Clone)]
-struct TimestampedRepliesHandler {
-    id: ID,
-    statesref: Arc<Mutex<State>>,
-}
-
-#[zenoh_macros::unstable]
-impl Drop for TimestampedRepliesHandler {
-    fn drop(&mut self) {
-        let states = &mut *zlock!(self.statesref);
-        // use peek_mut so query without samples do not prevent the state to be garbage collected
-        if let Some(state) = states.timestamped_states.peek_mut(&self.id) {
-            state.pending_queries = state.pending_queries.saturating_sub(1);
-            if states.global_pending_queries == 0 {
-                tracing::trace!(
-                    "AdvancedSubscriber{{key_expr: {}}}: Flush timestamped samples",
-                    states.key_expr
-                );
-                flush_timestamped_source(state, states.callback.as_ref());
-            }
-        }
     }
 }
 
@@ -2918,8 +1771,9 @@ mod tests {
         bytes::ZBytes,
         config::{Config, WhatAmI},
         internal::{traits::SampleBuilderTrait, ztimeout},
-        query::Query,
-        sample::{FragInfo, SampleBuilder},
+        query::{ConsolidationMode, Query, Reply, ReplyKeyExpr},
+        sample::{FragInfo, SampleBuilder, SourceInfo},
+        time::Timestamp,
     };
     use zenoh_config::ModeDependentValue;
 
@@ -2983,7 +1837,7 @@ mod tests {
                     retransmission: true,
                     frag_recovery_delay: RecoveryConfig::<true>::default().frag_recovery_delay,
                     period: None,
-                    max_history_depth: 10,
+                    max_pending_samples: 10,
                     query_target: QueryTarget::All,
                     query_timeout: Duration::from_secs(10),
                     max_fragments: MAX_FRAGMENTS_DEFAULT,
@@ -3005,24 +1859,18 @@ mod tests {
             .source_info(SourceInfo::new(source_id, 0))
             .into();
 
-        let (new_source, new_frag) = {
+        let inserted = {
             let mut states = zlock!(statesref);
             handle_sample(&mut states, frag1)
         };
-        assert!(new_source);
-        assert!(new_frag);
+        assert!(inserted.new_source);
+        assert!(inserted.new_fragment_slot);
 
         // Arm the fragment recovery scan like the live callback does.
         {
             let mut states = zlock!(statesref);
             let state = states.sequenced_states.get_mut(&source_id).unwrap();
-            arm_frag_recovery(
-                &statesref,
-                &key_expr,
-                state,
-                source_id,
-                Duration::from_millis(500),
-            );
+            state.arm_fragment_recovery(&statesref, source_id, Duration::from_millis(500));
         }
 
         // Wait for reassembled delivery: fragments 0 and 2 must have come
@@ -3072,11 +1920,11 @@ mod tests {
         let _ = ztimeout!(session.close());
     }
 
-    /// Completing fragment recovery must resume whole-sample recovery if a
+    /// Completing fragment recovery must resume sample recovery if a
     /// preceding sequence number is still missing, without another live sample
     /// or a periodic/heartbeat query to trigger it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_fragment_recovery_resumes_whole_sample_recovery() {
+    async fn test_fragment_recovery_resumes_sample_recovery() {
         zenoh_util::init_log_from_env_or("error");
         let mut config = Config::default();
         config.scouting.multicast.set_enabled(Some(false)).unwrap();
@@ -3112,7 +1960,7 @@ mod tests {
         assert_eq!(baseline.source_info().unwrap().source_sn(), 0);
 
         // SN 1 is entirely lost. Receiving fragment 1 of SN 2 opens a hole:
-        // its immediate recovery query temporarily gates whole-sample recovery.
+        // its fragment-recovery query temporarily delays the sample-recovery query.
         ztimeout!(session
             .put(key_expr, "4567")
             .source_info(SourceInfo::new(source_id, 2))
@@ -3204,7 +2052,7 @@ mod tests {
                     retransmission: true,
                     frag_recovery_delay: RecoveryConfig::<true>::default().frag_recovery_delay,
                     period: None,
-                    max_history_depth: 10,
+                    max_pending_samples: 10,
                     query_target: QueryTarget::All,
                     query_timeout: Duration::from_secs(10),
                     max_fragments: MAX_FRAGMENTS_DEFAULT,
@@ -3228,20 +2076,14 @@ mod tests {
                 .frag_info(FragInfo::new(3, 1))
                 .source_info(SourceInfo::new(source_id, sn))
                 .into();
-            let (_new_source, new_frag) = {
+            let inserted = {
                 let mut states = zlock!(statesref);
                 handle_sample(&mut states, frag)
             };
-            assert!(new_frag);
+            assert!(inserted.new_fragment_slot);
             let mut states = zlock!(statesref);
             let state = states.sequenced_states.get_mut(&source_id).unwrap();
-            arm_frag_recovery(
-                &statesref,
-                &key_expr,
-                state,
-                source_id,
-                Duration::from_millis(500),
-            );
+            state.arm_fragment_recovery(&statesref, source_id, Duration::from_millis(500));
         }
 
         // Wait for both reassembled samples to be delivered, in order.
@@ -3296,7 +2138,7 @@ mod tests {
     }
 
     /// Build a reassembly state with recovery enabled, collecting deliveries.
-    fn frag_recovery_state(
+    pub(super) fn frag_recovery_state(
         session: &Session,
         key_expr: &KeyExpr<'static>,
         received: Arc<Mutex<Vec<Sample>>>,
@@ -3311,7 +2153,7 @@ mod tests {
             retransmission: true,
             frag_recovery_delay: RecoveryConfig::<true>::default().frag_recovery_delay,
             period: None,
-            max_history_depth: 10,
+            max_pending_samples: 10,
             query_target: QueryTarget::All,
             query_timeout: Duration::from_secs(10),
             max_fragments: MAX_FRAGMENTS_DEFAULT,
@@ -3325,7 +2167,8 @@ mod tests {
     }
 
     /// Insert a fragment and run fragment recovery like the live callback
-    /// does (`handle_sample` + `frag_recovery_on_fragment`).
+    /// does: buffer the fragment and count any new query under the lock,
+    /// then schedule the query on the application runtime after unlocking.
     #[allow(clippy::too_many_arguments)]
     fn feed_fragment(
         statesref: &Arc<Mutex<State>>,
@@ -3342,24 +2185,33 @@ mod tests {
             .source_info(SourceInfo::new(source_id, sn))
             .into();
         let mut states = zlock!(statesref);
-        let source_info = frag.source_info().cloned();
-        let is_fragmented = frag.frag_info().is_some();
-        let (_new_source, new_frag) = handle_sample(&mut states, frag);
-        if is_fragmented {
-            if let Some(source_info) = source_info.as_ref() {
-                let source_id = *source_info.source_id();
-                if let Some(state) = states.sequenced_states.get_mut(&source_id) {
-                    frag_recovery_on_fragment(
-                        statesref,
-                        key_expr,
-                        state,
-                        source_id,
-                        source_info.source_sn().into(),
-                        new_frag,
-                        delay,
-                    );
-                }
-            }
+        let inserted = handle_sample(&mut states, frag);
+        let request = states
+            .sequenced_states
+            .get_mut(&source_id)
+            .unwrap()
+            .on_fragment(
+                statesref,
+                source_id,
+                sn.into(),
+                inserted.new_fragment_slot,
+                delay,
+            );
+        let generation = states
+            .sequenced_states
+            .peek(&source_id)
+            .unwrap()
+            .generation
+            .clone();
+        let context = QueryContext::new(&states);
+        drop(states);
+        if let Some(request) = request {
+            ZRuntime::Application.spawn(context.fragment_query_task(
+                statesref,
+                source_id,
+                &generation,
+                request,
+            ));
         }
     }
 
@@ -3390,17 +2242,17 @@ mod tests {
                 .source_info(SourceInfo::new(source_id, 1))
                 .frag_info(FragInfo::new(2, 0))
                 .into();
-            let (_, new_frag) = handle_sample(&mut states, fragment.clone());
+            let inserted = handle_sample(&mut states, fragment.clone());
             let state = states.sequenced_states.peek_mut(&source_id).unwrap();
-            frag_recovery_on_fragment(
-                &statesref,
-                &key_expr,
-                state,
-                source_id,
-                WrappingSn(1),
-                new_frag,
-                delay,
-            );
+            assert!(state
+                .on_fragment(
+                    &statesref,
+                    source_id,
+                    WrappingSn(1),
+                    inserted.new_fragment_slot,
+                    delay,
+                )
+                .is_none());
             let FragmentedSample::Partial { last_progress, .. } =
                 state.pending_samples.get_mut(&WrappingSn(1)).unwrap()
             else {
@@ -3421,8 +2273,10 @@ mod tests {
                     .pending_samples
                     .get(&WrappingSn(1))
                     .unwrap()
-                    .missing_tail(delay),
-                Some((Some(1), None))
+                    .clone()
+                    .prepare_recovery(delay, true)
+                    .map(|(ranges, _)| ranges),
+                Some(vec![(Some(1), None)])
             );
         }
 
@@ -3828,11 +2682,11 @@ mod tests {
         }
 
         // Invoke the tick helper directly to avoid timing-dependent overlap.
-        periodic_query(&statesref, source_id);
+        SequencedRepliesHandler::periodic(&statesref, source_id);
         let query = ztimeout!(cache.recv_async()).unwrap();
         assert_eq!(query.parameters().get("_sn"), Some("1.."));
         for _ in 0..5 {
-            periodic_query(&statesref, source_id);
+            SequencedRepliesHandler::periodic(&statesref, source_id);
             let states = zlock!(statesref);
             let state = states.sequenced_states.peek(&source_id).unwrap();
             assert_eq!(state.pending_queries, 1);
@@ -3873,7 +2727,7 @@ mod tests {
             .is_empty());
 
         // Coalescing must not disable subsequent periodic recovery.
-        periodic_query(&statesref, source_id);
+        SequencedRepliesHandler::periodic(&statesref, source_id);
         let query = ztimeout!(cache.recv_async()).unwrap();
         assert_eq!(query.parameters().get("_sn"), Some("3.."));
         assert_eq!(
@@ -3904,8 +2758,8 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// Periodic queries must respect both global history reservations and
-    /// per-source ordinary/fragment recovery reservations.
+    /// Do not start a periodic query while a history query or another recovery
+    /// query for this source is still running.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_periodic_queries_respect_pending_queries() {
         let mut config = Config::default();
@@ -3929,7 +2783,7 @@ mod tests {
                     .get_or_insert_mut(source_id, Default::default)
                     .pending_queries = source_pending;
             }
-            periodic_query(&statesref, source_id);
+            SequencedRepliesHandler::periodic(&statesref, source_id);
             {
                 let states = zlock!(statesref);
                 assert_eq!(states.global_pending_queries, global_pending);
@@ -3952,7 +2806,7 @@ mod tests {
                 .unwrap()
                 .pending_queries = 0;
         }
-        periodic_query(&statesref, source_id);
+        SequencedRepliesHandler::periodic(&statesref, source_id);
         let query = ztimeout!(cache.recv_async()).unwrap();
         assert_eq!(query.parameters().get("_sn"), Some(".."));
         drop(query);
@@ -3960,7 +2814,7 @@ mod tests {
     }
 
     /// A final sample stays recoverable after an empty/error/timeout response,
-    /// through either live fragments or a later ordinary retransmission.
+    /// through either published fragments or replies to a later sample-recovery query.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_final_fragmented_sample_recovers_after_failure() {
         let mut config = Config::default();
@@ -3970,7 +2824,11 @@ mod tests {
         let source_id = EntityGlobalId::new(session.zid(), 7);
         let key = KeyExpr::try_from("test/ext/frag/final_retry").unwrap();
         for failure in ["empty", "error", "timeout"] {
-            for recovery in ["live", "ordinary", "whole"] {
+            for recovery in [
+                "live",
+                "sample-query-fragments",
+                "sample-query-unfragmented",
+            ] {
                 let cache =
                     ztimeout!(session.declare_queryable("test/ext/frag/final_retry/@adv/**"))
                         .unwrap();
@@ -4048,11 +2906,11 @@ mod tests {
                         .unwrap();
                     }
                 } else {
-                    periodic_query(&sub.statesref, source_id);
+                    SequencedRepliesHandler::periodic(&sub.statesref, source_id);
                     let query = ztimeout!(cache.recv_async()).unwrap();
                     assert_eq!(query.parameters().get("_sn"), Some("1.."));
                     assert!(query.parameters().get("_fn").is_none());
-                    if recovery == "whole" {
+                    if recovery == "sample-query-unfragmented" {
                         ztimeout!(query.reply_sample(
                             SampleBuilder::put(key.clone(), "abcdef")
                                 .source_info(SourceInfo::new(source_id, 1))
@@ -4240,10 +3098,10 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// Failed-slot retries must not replenish the pending-query counter while
-    /// an ordinary query is outstanding, through scans or duplicate arrivals.
+    /// Do not retry fragment recovery while a sample-recovery query is running.
+    /// Both timer ticks and duplicate arrivals must wait for that query to finish.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn test_fragment_retry_waits_for_ordinary_query() {
+    async fn test_fragment_retry_waits_for_sample_recovery_query() {
         let mut config = Config::default();
         config.scouting.multicast.set_enabled(Some(false)).unwrap();
         config.listen.endpoints.set(vec![]).unwrap();
@@ -4285,9 +3143,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
-        periodic_query(&sub.statesref, source_id);
-        let ordinary = ztimeout!(cache.recv_async()).unwrap();
-        assert!(ordinary.parameters().get("_fn").is_none());
+        SequencedRepliesHandler::periodic(&sub.statesref, source_id);
+        let sample_query = ztimeout!(cache.recv_async()).unwrap();
+        assert!(sample_query.parameters().get("_fn").is_none());
         // More than a full cooldown and scan period elapse while this query is held.
         assert!(tokio::time::timeout(delay * 3, cache.recv_async())
             .await
@@ -4308,7 +3166,7 @@ mod tests {
                 .pending_queries,
             1
         );
-        drop(ordinary);
+        drop(sample_query);
         let retry = ztimeout!(cache.recv_async()).unwrap();
         assert_eq!(retry.parameters().get("_fn"), Some("0..1"));
         for (num, payload) in [(0, "ab"), (1, "cd")] {
@@ -4538,13 +3396,11 @@ mod tests {
                     .source_info(SourceInfo::new(source_id, 2))
                     .into(),
             );
-            arm_frag_recovery(
-                &statesref,
-                &key,
-                states.sequenced_states.peek_mut(&source_id).unwrap(),
-                source_id,
-                Duration::from_millis(20),
-            );
+            states
+                .sequenced_states
+                .peek_mut(&source_id)
+                .unwrap()
+                .arm_fragment_recovery(&statesref, source_id, Duration::from_millis(20));
         }
         let first = ztimeout!(cache.recv_async()).unwrap();
         let second = ztimeout!(cache.recv_async()).unwrap();
@@ -4595,10 +3451,10 @@ mod tests {
     }
 
     /// Build a reassembly state with no retransmission and the given
-    /// `max_history_depth`, collecting deliveries and misses.
+    /// `max_pending_samples`, collecting deliveries and misses.
     fn pending_bound_state(
         session: &Session,
-        max_history_depth: usize,
+        max_pending_samples: usize,
         received: Arc<Mutex<Vec<Sample>>>,
         misses: Arc<Mutex<Vec<u32>>>,
     ) -> Arc<Mutex<State>> {
@@ -4612,7 +3468,7 @@ mod tests {
             retransmission: false,
             frag_recovery_delay: RecoveryConfig::<true>::default().frag_recovery_delay,
             period: None,
-            max_history_depth,
+            max_pending_samples,
             query_target: QueryTarget::All,
             query_timeout: Duration::from_secs(10),
             max_fragments: MAX_FRAGMENTS_DEFAULT,
@@ -4703,8 +3559,9 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// Failure of SN 1 must not discard SN 2's active live tail merely because
-    /// complete SN 3 is buffered behind it, nor trigger a whole-sample flush.
+    /// Failed recovery of sample 1 must not discard sample 2, whose remaining
+    /// fragments are still arriving, just because sample 3 is complete. It must
+    /// not skip missing sequence numbers that still need a sample-recovery query.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_fragment_failure_preserves_other_partial_sample() {
         let mut config = Config::default();
@@ -4780,7 +3637,7 @@ mod tests {
         );
         // Exercise the scheduled gap check directly as well: abandoned SN 1
         // must not make the still-pending SN 2 look like a sequence-number gap.
-        recover_sequence_gap(&sub.statesref, source_id);
+        SequencedRepliesHandler::recover_gap(&sub.statesref, source_id);
         assert!(cache.try_recv().unwrap().is_none());
         assert!(sub.try_recv().unwrap().is_none());
         assert!(misses.try_recv().unwrap().is_none());
@@ -5016,10 +3873,11 @@ mod tests {
                 .pending_samples
                 .get_mut(&WrappingSn(1))
                 .unwrap()
-                .begin_recovery(Duration::ZERO)
-                .unwrap();
+                .prepare_recovery(Duration::ZERO, true)
+                .unwrap()
+                .1;
             state.pending_queries = 1;
-            FragRecoveryRepliesHandler {
+            FragmentAttempt {
                 source_id,
                 statesref: statesref.clone(),
                 generation: state.generation.clone(),
@@ -5062,8 +3920,8 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// A completed ordinary query must preserve a recoverable partial, then
-    /// resume its bounded flush after live completion, recovery, or failure.
+    /// A history or sample-recovery query must keep samples with missing fragments.
+    /// Delivery resumes once those fragments arrive or recovery gives up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_query_flush_preserves_recoverable_partials() {
         let mut config = Config::default();
@@ -5129,7 +3987,7 @@ mod tests {
                             let state = states.sequenced_states.peek(&source_id).unwrap();
                             assert_eq!(state.last_delivered, Some(WrappingSn(baseline)));
                             assert_eq!(state.pending_samples.len(), 2);
-                            assert_eq!(state.pending_flush, Some(WrappingSn(successor)));
+                            assert_eq!(state.gap_skip_through, Some(WrappingSn(successor)));
                             if outcome == "live" {
                                 // Resolve before the scan needs to issue any query.
                                 handle_sample(&mut states, frag(1));
@@ -5194,7 +4052,7 @@ mod tests {
                         let states = zlock!(statesref);
                         let state = states.sequenced_states.peek(&source_id).unwrap();
                         assert!(state.pending_samples.is_empty());
-                        assert!(state.pending_flush.is_none());
+                        assert!(state.gap_skip_through.is_none());
                     }
                 }
             }
@@ -5202,8 +4060,8 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// A partial received only in ordinary replies must get targeted recovery
-    /// even when a complete successor is buffered behind it.
+    /// Missing fragments in history or sample-recovery replies must trigger
+    /// fragment recovery, even when a newer complete sample is buffered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_query_only_partial_before_complete_successor_is_recovered() {
         let mut config = Config::default();
@@ -5284,8 +4142,9 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// Deferred permission to cross gaps must stop at the original complete
-    /// successor, even if later publications arrive while a partial blocks it.
+    /// A query finishes with sample 3 buffered, so delivery may skip missing
+    /// sample 2 after sample 1's fragments arrive. Receiving sample 5 later
+    /// must not also cause missing sample 4 to be skipped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_deferred_flush_does_not_skip_future_gap() {
         let mut config = Config::default();
@@ -5314,18 +4173,18 @@ mod tests {
             handle_sample(&mut states, single(0));
             handle_sample(&mut states, frag(0));
             handle_sample(&mut states, single(3));
-            flush_sequenced_source(&statesref, &mut states, &source_id);
+            states.on_history_or_sample_recovery_finished(&statesref, &source_id);
             handle_sample(&mut states, single(5));
             handle_sample(&mut states, frag(1));
             let state = states.sequenced_states.peek(&source_id).unwrap();
             assert_eq!(state.last_delivered, Some(WrappingSn(3)));
             assert!(state.pending_samples.contains_key(&WrappingSn(5)));
-            assert!(state.pending_flush.is_none());
+            assert!(state.gap_skip_through.is_none());
         }
         assert_eq!(*misses.lock().unwrap(), [1]);
         assert_eq!(received.lock().unwrap().len(), 3);
         let cache = ztimeout!(session.declare_queryable("test/ext/pending/@adv/**")).unwrap();
-        recover_sequence_gap(&statesref, source_id);
+        SequencedRepliesHandler::recover_gap(&statesref, source_id);
         let query = ztimeout!(cache.recv_async()).unwrap();
         assert_eq!(query.parameters().get("_sn"), Some("4.."));
         drop(query);
@@ -5382,14 +4241,14 @@ mod tests {
                     handle_sample(&mut states, frag(3, 0));
                     handle_sample(&mut states, single(5));
                 }
-                flush_sequenced_source(&statesref, &mut states, &source_id);
+                states.on_history_or_sample_recovery_finished(&statesref, &source_id);
                 if evict {
                     handle_sample(&mut states, frag(4, 0));
                     let state = states.sequenced_states.peek(&source_id).unwrap();
                     assert_eq!(state.last_delivered, Some(WrappingSn(3)));
                     assert_eq!(state.pending_samples.len(), 1);
                     assert!(state.pending_samples.contains_key(&WrappingSn(4)));
-                    assert!(state.pending_flush.is_none());
+                    assert!(state.gap_skip_through.is_none());
                 } else {
                     handle_sample(&mut states, frag(1, 1));
                     let state = states.sequenced_states.peek(&source_id).unwrap();
@@ -5399,12 +4258,12 @@ mod tests {
                         .get(&WrappingSn(3))
                         .unwrap()
                         .is_incomplete());
-                    assert_eq!(state.pending_flush, Some(WrappingSn(5)));
+                    assert_eq!(state.gap_skip_through, Some(WrappingSn(5)));
                     handle_sample(&mut states, frag(3, 1));
                     let state = states.sequenced_states.peek(&source_id).unwrap();
                     assert_eq!(state.last_delivered, Some(WrappingSn(5)));
                     assert!(state.pending_samples.is_empty());
-                    assert!(state.pending_flush.is_none());
+                    assert!(state.gap_skip_through.is_none());
                 }
             }
             assert_eq!(
@@ -5416,8 +4275,9 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// Fragment completion must use the captured boundary, while a second
-    /// ordinary query may extend it. Exercise both query completion orders.
+    /// Finishing fragment recovery must not change which missing samples can
+    /// be skipped. Another sample-recovery query can extend that limit. Check both
+    /// orders in which the queries can finish.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_deferred_flush_overlapping_queries_and_boundary_extension() {
         let mut config = Config::default();
@@ -5437,7 +4297,7 @@ mod tests {
                 .frag_info(FragInfo::new(2, num))
                 .into()
         };
-        for (ordinary_first, extend) in [(false, false), (true, false), (true, true)] {
+        for (sample_query_first, extend) in [(false, false), (true, false), (true, true)] {
             let received = Arc::new(Mutex::new(Vec::<Sample>::new()));
             let misses = Arc::new(Mutex::new(Vec::<u32>::new()));
             let statesref = pending_bound_state(&session, 10, received.clone(), misses.clone());
@@ -5453,16 +4313,17 @@ mod tests {
                     .pending_samples
                     .get_mut(&WrappingSn(1))
                     .unwrap()
-                    .begin_recovery(Duration::ZERO)
-                    .unwrap();
+                    .prepare_recovery(Duration::ZERO, true)
+                    .unwrap()
+                    .1;
                 state.pending_queries = 2;
                 (state.generation.clone(), attempt)
             };
-            let ordinary = SequencedRepliesHandler {
+            let sample_query = SequencedRepliesHandler {
                 source_id,
                 statesref: statesref.clone(),
             };
-            let fragment = FragRecoveryRepliesHandler {
+            let fragment = FragmentAttempt {
                 source_id,
                 statesref: statesref.clone(),
                 generation,
@@ -5470,8 +4331,8 @@ mod tests {
                 ranges: vec![(Some(1), None)],
                 attempt,
             };
-            if ordinary_first {
-                drop(ordinary);
+            if sample_query_first {
+                drop(sample_query);
                 // This successor was not covered by the completed query.
                 handle_sample(&mut zlock!(statesref), single(5));
                 if extend {
@@ -5489,7 +4350,7 @@ mod tests {
                             .sequenced_states
                             .peek(&source_id)
                             .unwrap()
-                            .pending_flush,
+                            .gap_skip_through,
                         Some(WrappingSn(5))
                     );
                 }
@@ -5503,13 +4364,13 @@ mod tests {
                 assert_eq!(state.pending_samples.contains_key(&WrappingSn(5)), !extend);
             } else {
                 drop(fragment);
-                drop(ordinary);
+                drop(sample_query);
                 handle_sample(&mut zlock!(statesref), single(5));
             }
-            // A fresh ordinary query explicitly permits crossing SN 4. Hold
+            // A new sample-recovery query allows skipping missing SN 4. Hold
             // its reply handler so the scheduled gap recheck cannot flush early.
             if !extend {
-                recover_sequence_gap(&statesref, source_id);
+                SequencedRepliesHandler::recover_gap(&statesref, source_id);
                 let query = ztimeout!(cache.recv_async()).unwrap();
                 assert_eq!(query.parameters().get("_sn"), Some("4.."));
                 drop(query);
@@ -5532,7 +4393,7 @@ mod tests {
                 let states = zlock!(statesref);
                 let state = states.sequenced_states.peek(&source_id).unwrap();
                 assert_eq!(state.last_delivered, Some(WrappingSn(5)));
-                assert!(state.pending_flush.is_none());
+                assert!(state.gap_skip_through.is_none());
             }
             assert_eq!(*misses.lock().unwrap(), [2, 1]);
             assert_eq!(received.lock().unwrap().len(), 3);
@@ -5540,8 +4401,9 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// Ordinary query completion advances past gaps, but keeps partial samples
-    /// newer than its final delivery so their remaining live fragments suffice.
+    /// Finishing a history or sample-recovery query may skip missing sequence
+    /// numbers. Keep newer incomplete samples so later publications can fill
+    /// their missing fragments.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_query_completion_preserves_trailing_partial_samples() {
         let mut config = Config::default();
@@ -5587,7 +4449,9 @@ mod tests {
                     }
                     for sample in pending {
                         let info = sample.source_info().unwrap().clone();
-                        insert_fragment(state, sample, &info, MAX_FRAGMENTS_DEFAULT).unwrap();
+                        state
+                            .insert_sample(sample, &info, MAX_FRAGMENTS_DEFAULT)
+                            .unwrap();
                     }
                 }
                 if history {
@@ -5655,8 +4519,8 @@ mod tests {
         ztimeout!(session.close()).unwrap();
     }
 
-    /// A trailing partial received only through ordinary query replies must
-    /// still get targeted recovery after that query has finished.
+    /// If the last sample in history or sample-recovery replies has missing
+    /// fragments, query for them after that query finishes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_query_completion_recovers_trailing_partial_sample() {
         let mut config = Config::default();
@@ -5686,7 +4550,7 @@ mod tests {
                 .unwrap();
                 let baseline = ztimeout!(sub.recv_async()).unwrap();
                 assert_eq!(baseline.source_info().unwrap().source_sn(), 0);
-                // Missing SN 1 triggers whole-sample recovery. The query's
+                // Missing SN 1 triggers a sample-recovery query. The query's
                 // trailing partial must survive delivery of complete SN 2.
                 ztimeout!(session
                     .put(&key_expr, "next")
@@ -5769,7 +4633,7 @@ mod tests {
             let history = InitialRepliesHandler {
                 statesref: statesref.clone(),
             };
-            let fragment = FragRecoveryRepliesHandler {
+            let fragment = FragmentAttempt {
                 source_id,
                 statesref: statesref.clone(),
                 generation: zlock!(statesref)
@@ -6398,14 +5262,14 @@ mod tests {
             .advanced()
             .max_pending_samples(7))
         .unwrap();
-        assert_eq!(zlock!(sub.statesref).max_history_depth, 7);
+        assert_eq!(zlock!(sub.statesref).max_pending_samples, 7);
 
         let sub2 = ztimeout!(session
             .declare_subscriber("test/ext/mps/b")
             .advanced()
             .history(HistoryConfig::default().max_samples(5)))
         .unwrap();
-        assert_eq!(zlock!(sub2.statesref).max_history_depth, 5);
+        assert_eq!(zlock!(sub2.statesref).max_pending_samples, 5);
 
         let sub3 = ztimeout!(session
             .declare_subscriber("test/ext/mps/c")
@@ -6413,11 +5277,11 @@ mod tests {
             .history(HistoryConfig::default().max_samples(5))
             .max_pending_samples(9))
         .unwrap();
-        assert_eq!(zlock!(sub3.statesref).max_history_depth, 9);
+        assert_eq!(zlock!(sub3.statesref).max_pending_samples, 9);
 
         let sub4 = ztimeout!(session.declare_subscriber("test/ext/mps/d").advanced()).unwrap();
         assert_eq!(
-            zlock!(sub4.statesref).max_history_depth,
+            zlock!(sub4.statesref).max_pending_samples,
             DEFAULT_MAX_PENDING_SAMPLES
         );
 
@@ -6536,7 +5400,7 @@ mod tests {
                 retransmission: false,
                 frag_recovery_delay: RecoveryConfig::<true>::default().frag_recovery_delay,
                 period: None,
-                max_history_depth: 10,
+                max_pending_samples: 10,
                 query_target: QueryTarget::All,
                 query_timeout: Duration::from_secs(10),
                 max_fragments: MAX_FRAGMENTS_DEFAULT,
@@ -6557,8 +5421,8 @@ mod tests {
             .into();
         {
             let mut states = zlock!(statesref);
-            let (_, new_frag) = handle_sample(&mut states, orphan);
-            assert!(!new_frag);
+            let inserted = handle_sample(&mut states, orphan);
+            assert!(!inserted.new_fragment_slot);
             assert!(
                 states.sequenced_states.is_empty() && states.timestamped_states.is_empty(),
                 "no state must be created for an orphan fragment"
@@ -6581,8 +5445,8 @@ mod tests {
             .into();
         {
             let mut states = zlock!(statesref);
-            let (_, new_frag) = handle_sample(&mut states, sequenced);
-            assert!(new_frag);
+            let inserted = handle_sample(&mut states, sequenced);
+            assert!(inserted.new_fragment_slot);
             let state = states.sequenced_states.get_mut(&source_id).unwrap();
             assert_eq!(state.pending_samples.len(), 1);
         }
