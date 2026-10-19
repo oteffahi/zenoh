@@ -33,7 +33,7 @@ use zenoh::{
 };
 
 use super::{
-    queries::{reserve_queries, FragmentRequest, QueryContext, SequencedRepliesHandler},
+    queries::{reserve_queries, FragmentRequest, QueryContext, QueryScope, RepliesHandler},
     SequencedSource, State,
 };
 use crate::{
@@ -51,7 +51,7 @@ impl State {
             self.on_history_or_sample_recovery_finished(statesref, &source_id);
             let source = self.sequenced_states.peek_mut(&source_id).unwrap();
             source.periodic_task =
-                SequencedRepliesHandler::spawn_periodic(statesref, self.period, source_id);
+                RepliesHandler::spawn_periodic(statesref, self.period, source_id);
         }
         for (_, source) in self.timestamped_states.iter_mut() {
             source.flush(self.callback.as_ref());
@@ -132,7 +132,7 @@ impl State {
     }
 }
 
-impl SequencedRepliesHandler {
+impl RepliesHandler {
     /// Check for missing samples and reserve the query under the same lock, so
     /// two callers cannot start the same query. Send it after unlocking.
     pub(super) fn recover_gap(statesref: &Arc<Mutex<State>>, source_id: EntityGlobalId) {
@@ -164,10 +164,10 @@ impl SequencedRepliesHandler {
             (QueryContext::new(&states), start)
         };
         Self {
-            source_id,
+            scope: QueryScope::Sequenced(source_id),
             statesref: statesref.clone(),
         }
-        .issue(
+        .send_query(
             &context,
             Selector::from((
                 context.source_key(source_id),
@@ -209,10 +209,10 @@ impl SequencedRepliesHandler {
             (QueryContext::new(&states), start)
         };
         Self {
-            source_id,
+            scope: QueryScope::Sequenced(source_id),
             statesref: statesref.clone(),
         }
-        .issue(
+        .send_query(
             &context,
             Selector::from((
                 context.source_key(source_id),

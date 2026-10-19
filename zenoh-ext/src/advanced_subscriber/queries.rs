@@ -96,7 +96,7 @@ impl QueryContext {
         for request in requests {
             request
                 .into_attempt(statesref, source_id, generation)
-                .issue(self, &query_expr);
+                .send_query(self, &query_expr);
         }
     }
 
@@ -115,12 +115,12 @@ impl QueryContext {
         let attempt = request.into_attempt(statesref, source_id, generation);
         async move {
             let query_expr = self.source_key(source_id);
-            attempt.issue(&self, &query_expr);
+            attempt.send_query(&self, &query_expr);
         }
     }
 
     /// Send a query and pass only samples matching the subscription key to the callback.
-    pub(super) fn issue(
+    pub(super) fn send_query(
         &self,
         selector: Selector<'_>,
         callback: impl Fn(Sample) + Send + Sync + 'static,
@@ -170,9 +170,29 @@ impl HistoryConfig {
     }
 }
 
-impl State {
-    fn receive_query_sample(statesref: &Mutex<Self>, sample: Sample) {
-        let states = &mut *zlock!(statesref);
+/// Selects the pending-query counter and completion policy for an ordinary query.
+pub(super) enum QueryScope {
+    Global,
+    Sequenced(EntityGlobalId),
+    Timestamped(ID),
+}
+
+/// Owns one history or whole-sample recovery query reservation until its reply
+/// callback is dropped.
+/// Do not clone query handlers: each drop releases one reservation made under
+/// the state lock before constructing the handler.
+pub(super) struct RepliesHandler {
+    pub(super) scope: QueryScope,
+    pub(super) statesref: Arc<Mutex<State>>,
+}
+
+impl RepliesHandler {
+    pub(super) fn send_query(self, context: &QueryContext, selector: Selector<'_>) {
+        context.send_query(selector, move |sample| self.handle_reply(sample));
+    }
+
+    fn handle_reply(&self, sample: Sample) {
+        let states = &mut *zlock!(self.statesref);
         tracing::trace!(
             "AdvancedSubscriber{{key_expr: {}}}: Received reply with Sample{{info:{:?}, ts:{:?}}}",
             states.key_expr,
@@ -183,95 +203,30 @@ impl State {
     }
 }
 
-/// Keeps a history query counted as pending until its reply callback is dropped.
-/// Do not clone query handlers: each drop releases one reservation made under
-/// the state lock before constructing the handler.
-pub(super) struct InitialRepliesHandler {
-    pub(super) statesref: Arc<Mutex<State>>,
-}
-
-/// Owns one source-specific history or whole-sample recovery query reservation.
-pub(super) struct SequencedRepliesHandler {
-    pub(super) source_id: EntityGlobalId,
-    pub(super) statesref: Arc<Mutex<State>>,
-}
-
-/// Owns one timestamped source's history query reservation.
-pub(super) struct TimestampedRepliesHandler {
-    pub(super) id: ID,
-    pub(super) statesref: Arc<Mutex<State>>,
-}
-
-impl InitialRepliesHandler {
-    fn complete(&self) {
-        let states = &mut *zlock!(self.statesref);
-        if finish_query(&mut states.global_pending_queries) {
-            states.on_initial_queries_finished(&self.statesref);
-        }
-    }
-
-    pub(super) fn issue(self, context: &QueryContext, selector: Selector<'_>) {
-        context.issue(selector, move |sample| self.handle_reply(sample));
-    }
-
-    fn handle_reply(&self, sample: Sample) {
-        State::receive_query_sample(&self.statesref, sample);
-    }
-}
-
-impl Drop for InitialRepliesHandler {
+impl Drop for RepliesHandler {
     fn drop(&mut self) {
-        self.complete();
-    }
-}
-
-impl TimestampedRepliesHandler {
-    fn complete(&self) {
         let states = &mut *zlock!(self.statesref);
-        if let Some(source) = states.timestamped_states.peek_mut(&self.id) {
-            finish_query(&mut source.pending_queries);
-            states.on_timestamped_query_finished(&self.id);
+        match &self.scope {
+            QueryScope::Global => {
+                if finish_query(&mut states.global_pending_queries) {
+                    states.on_initial_queries_finished(&self.statesref);
+                }
+            }
+            QueryScope::Sequenced(source_id) => {
+                // Finishing a query without receiving samples must not keep an
+                // idle source in the cache longer.
+                if let Some(source) = states.sequenced_states.peek_mut(source_id) {
+                    finish_query(&mut source.pending_queries);
+                    states.on_history_or_sample_recovery_finished(&self.statesref, source_id);
+                }
+            }
+            QueryScope::Timestamped(id) => {
+                if let Some(source) = states.timestamped_states.peek_mut(id) {
+                    finish_query(&mut source.pending_queries);
+                    states.on_timestamped_query_finished(id);
+                }
+            }
         }
-    }
-
-    pub(super) fn issue(self, context: &QueryContext, selector: Selector<'_>) {
-        context.issue(selector, move |sample| self.handle_reply(sample));
-    }
-
-    fn handle_reply(&self, sample: Sample) {
-        State::receive_query_sample(&self.statesref, sample);
-    }
-}
-
-impl Drop for TimestampedRepliesHandler {
-    fn drop(&mut self) {
-        self.complete();
-    }
-}
-
-impl SequencedRepliesHandler {
-    fn complete(&self) {
-        let states = &mut *zlock!(self.statesref);
-        // Finishing a query without receiving samples must not keep an idle
-        // source in the cache longer.
-        if let Some(source) = states.sequenced_states.peek_mut(&self.source_id) {
-            finish_query(&mut source.pending_queries);
-            states.on_history_or_sample_recovery_finished(&self.statesref, &self.source_id);
-        }
-    }
-
-    pub(super) fn issue(self, context: &QueryContext, selector: Selector<'_>) {
-        context.issue(selector, move |sample| self.handle_reply(sample));
-    }
-
-    fn handle_reply(&self, sample: Sample) {
-        State::receive_query_sample(&self.statesref, sample);
-    }
-}
-
-impl Drop for SequencedRepliesHandler {
-    fn drop(&mut self) {
-        self.complete();
     }
 }
 
@@ -340,11 +295,11 @@ impl FragRecoveryAttempt {
             states.on_fragment_recovery_finished(self.source_id)
         };
         if should_recheck {
-            SequencedRepliesHandler::schedule_gap_recheck(&self.statesref, self.source_id);
+            RepliesHandler::schedule_gap_recheck(&self.statesref, self.source_id);
         }
     }
 
-    fn issue(self, context: &QueryContext, query_expr: &KeyExpr<'static>) {
+    fn send_query(self, context: &QueryContext, query_expr: &KeyExpr<'static>) {
         let seq_num_range = format_range("_sn", Some(self.sn), Some(self.sn));
         let attempt = Arc::new(self);
         // Keep this Arc until all range queries have been sent. Otherwise, if
@@ -359,7 +314,7 @@ impl FragRecoveryAttempt {
                     range.end.map(Into::into),
                 );
             let attempt = attempt.clone();
-            context.issue(
+            context.send_query(
                 Selector::from((query_expr.clone(), params)),
                 move |sample| attempt.handle_reply(sample),
             );

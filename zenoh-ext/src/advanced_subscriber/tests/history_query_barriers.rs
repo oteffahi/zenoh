@@ -15,16 +15,14 @@
 use super::*;
 
 fn finish_sample_query(history: bool, fixture: &BufferedSource) {
-    if history {
-        drop(InitialRepliesHandler {
-            statesref: fixture.states.clone(),
-        });
-    } else {
-        drop(SequencedRepliesHandler {
-            source_id: fixture.id,
-            statesref: fixture.states.clone(),
-        });
-    }
+    drop(RepliesHandler {
+        scope: if history {
+            QueryScope::Global
+        } else {
+            QueryScope::Sequenced(fixture.id)
+        },
+        statesref: fixture.states.clone(),
+    });
 }
 
 /// Held periodic queries coalesce; completion authorizes skipping an unavailable
@@ -37,11 +35,11 @@ async fn test_periodic_queries_coalesce_and_flush_unrecoverable_gap() {
     zlock!(fixture.states).retransmission = true;
     fixture.receive(fixture.whole(0, "base"));
     fixture.receive(fixture.whole(2, "next"));
-    SequencedRepliesHandler::periodic(&fixture.states, fixture.id);
+    RepliesHandler::periodic(&fixture.states, fixture.id);
     let query = ztimeout!(cache.recv_async()).unwrap();
     assert_eq!(query.parameters().get("_sn"), Some("1.."));
     for _ in 0..5 {
-        SequencedRepliesHandler::periodic(&fixture.states, fixture.id);
+        RepliesHandler::periodic(&fixture.states, fixture.id);
         let states = zlock!(fixture.states);
         let source = states.sequenced_states.peek(&fixture.id).unwrap();
         assert_eq!(source.pending_queries, 1);
@@ -59,7 +57,7 @@ async fn test_periodic_queries_coalesce_and_flush_unrecoverable_gap() {
         .unwrap()
         .pending_samples
         .is_empty());
-    SequencedRepliesHandler::periodic(&fixture.states, fixture.id);
+    RepliesHandler::periodic(&fixture.states, fixture.id);
     let query = ztimeout!(cache.recv_async()).unwrap();
     assert_eq!(query.parameters().get("_sn"), Some("3.."));
     assert_eq!(
@@ -91,7 +89,7 @@ async fn test_periodic_queries_respect_pending_queries() {
                 .get_or_insert_mut(fixture.id, Default::default)
                 .pending_queries = source_pending;
         }
-        SequencedRepliesHandler::periodic(&fixture.states, fixture.id);
+        RepliesHandler::periodic(&fixture.states, fixture.id);
         {
             let states = zlock!(fixture.states);
             assert_eq!(states.global_pending_queries, global_pending);
@@ -111,7 +109,7 @@ async fn test_periodic_queries_respect_pending_queries() {
         .peek_mut(&fixture.id)
         .unwrap()
         .pending_queries = 0;
-    SequencedRepliesHandler::periodic(&fixture.states, fixture.id);
+    RepliesHandler::periodic(&fixture.states, fixture.id);
     let query = ztimeout!(cache.recv_async()).unwrap();
     assert_eq!(query.parameters().get("_sn"), Some(".."));
     drop(query);
@@ -293,7 +291,7 @@ async fn test_deferred_flush_does_not_skip_future_gap() {
     assert_eq!(*fixture.misses.lock().unwrap(), [1]);
     assert_eq!(fixture.received.lock().unwrap().len(), 3);
     let cache = ztimeout!(session.declare_queryable("test/ext/pending/@adv/**")).unwrap();
-    SequencedRepliesHandler::recover_gap(&fixture.states, fixture.id);
+    RepliesHandler::recover_gap(&fixture.states, fixture.id);
     let query = ztimeout!(cache.recv_async()).unwrap();
     assert_eq!(query.parameters().get("_sn"), Some("4.."));
     drop(query);
@@ -379,8 +377,8 @@ async fn test_deferred_flush_overlapping_queries_and_boundary_extension() {
             source.pending_queries = 2;
             (source.generation.clone(), attempt)
         };
-        let sample_query = SequencedRepliesHandler {
-            source_id: fixture.id,
+        let sample_query = RepliesHandler {
+            scope: QueryScope::Sequenced(fixture.id),
             statesref: fixture.states.clone(),
         };
         let fragment = FragRecoveryAttempt {
@@ -425,7 +423,7 @@ async fn test_deferred_flush_overlapping_queries_and_boundary_extension() {
         }
         // Hold the actual gap query so a scheduled recheck cannot flush early.
         if !extend {
-            SequencedRepliesHandler::recover_gap(&fixture.states, fixture.id);
+            RepliesHandler::recover_gap(&fixture.states, fixture.id);
             let query = ztimeout!(cache.recv_async()).unwrap();
             assert_eq!(query.parameters().get("_sn"), Some("4.."));
             drop(query);
@@ -599,7 +597,8 @@ async fn test_query_completion_flushes_after_overlapping_fragment_query() {
                 .unwrap()
                 .pending_queries = 1;
         }
-        let history = InitialRepliesHandler {
+        let history = RepliesHandler {
+            scope: QueryScope::Global,
             statesref: fixture.states.clone(),
         };
         let fragment = FragRecoveryAttempt {

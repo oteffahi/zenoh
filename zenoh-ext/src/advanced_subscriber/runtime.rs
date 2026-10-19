@@ -39,10 +39,7 @@ use zenoh::{
 
 use super::{
     handle_sample,
-    queries::{
-        reserve_queries, InitialRepliesHandler, QueryContext, SequencedRepliesHandler,
-        TimestampedRepliesHandler,
-    },
+    queries::{reserve_queries, QueryContext, QueryScope, RepliesHandler},
     HistoryConfig, RecoveryConfig, State,
 };
 use crate::{
@@ -98,8 +95,7 @@ fn on_publication(statesref: &Arc<Mutex<State>>, sample: Sample, recovery: Optio
         None
     };
     if inserted.new_source {
-        source.periodic_task =
-            SequencedRepliesHandler::spawn_periodic(statesref, states.period, source_id);
+        source.periodic_task = RepliesHandler::spawn_periodic(statesref, states.period, source_id);
     }
     let work = request.map(|request| (request, source.generation.clone()));
     let work = work.map(|(request, generation)| (request, generation, QueryContext::new(states)));
@@ -113,7 +109,7 @@ fn on_publication(statesref: &Arc<Mutex<State>>, sample: Sample, recovery: Optio
             request,
         ));
     }
-    SequencedRepliesHandler::recover_gap(statesref, source_id);
+    RepliesHandler::recover_gap(statesref, source_id);
 }
 
 /// Closing the underlying subscriber must drop the callback to close the receiver.
@@ -128,11 +124,12 @@ pub(super) fn query_history(
     key_expr: &KeyExpr<'_>,
     history: &HistoryConfig,
 ) {
-    let handler = InitialRepliesHandler {
+    let handler = RepliesHandler {
+        scope: QueryScope::Global,
         statesref: statesref.clone(),
     };
     let context = QueryContext::new(&zlock!(statesref));
-    handler.issue(
+    handler.send_query(
         &context,
         Selector::from((key_expr / KE_ADV_PREFIX / KE_STARSTAR, history.parameters())),
     );
@@ -195,10 +192,11 @@ fn on_liveliness(
         );
         reserve_queries(&mut states.global_pending_queries, 1);
         drop(states);
-        InitialRepliesHandler {
+        RepliesHandler {
+            scope: QueryScope::Global,
             statesref: statesref.clone(),
         }
-        .issue(
+        .send_query(
             context,
             Selector::from((sample.key_expr(), history.parameters())),
         );
@@ -236,11 +234,11 @@ fn on_timestamped_liveliness(
     source.alive = true;
     source.latest_access = Instant::now();
     drop(states);
-    TimestampedRepliesHandler {
-        id: ID::from(zid),
+    RepliesHandler {
+        scope: QueryScope::Timestamped(ID::from(zid)),
         statesref: statesref.clone(),
     }
-    .issue(
+    .send_query(
         context,
         Selector::from((sample.key_expr(), history.parameters())),
     );
@@ -277,18 +275,17 @@ fn on_sequenced_liveliness(
         Default::default()
     });
     if new {
-        source.periodic_task =
-            SequencedRepliesHandler::spawn_periodic(statesref, states.period, source_id);
+        source.periodic_task = RepliesHandler::spawn_periodic(statesref, states.period, source_id);
     }
     reserve_queries(&mut source.pending_queries, 1);
     source.alive = true;
     source.latest_access = Instant::now();
     drop(lock);
-    SequencedRepliesHandler {
-        source_id,
+    RepliesHandler {
+        scope: QueryScope::Sequenced(source_id),
         statesref: statesref.clone(),
     }
-    .issue(
+    .send_query(
         context,
         Selector::from((sample.key_expr(), history.parameters())),
     );
@@ -347,8 +344,7 @@ fn on_heartbeat(statesref: &Arc<Mutex<State>>, sample: Sample) {
     source.latest_access = Instant::now();
     if new {
         // NOTE: API does not allow both heartbeat and periodic_queries.
-        source.periodic_task =
-            SequencedRepliesHandler::spawn_periodic(statesref, states.period, source_id);
+        source.periodic_task = RepliesHandler::spawn_periodic(statesref, states.period, source_id);
         if states.global_pending_queries > 0 {
             tracing::trace!("AdvancedSubscriber{{key_expr: {}}}: Skipping heartbeat on '{}' from publisher that is currently being pulled by global query", states.key_expr, heartbeat_key);
             return;
@@ -366,11 +362,11 @@ fn on_heartbeat(statesref: &Arc<Mutex<State>>, sample: Sample) {
         reserve_queries(&mut source.pending_queries, 1);
         let context = QueryContext::new(states);
         drop(lock);
-        SequencedRepliesHandler {
-            source_id,
+        RepliesHandler {
+            scope: QueryScope::Sequenced(source_id),
             statesref: statesref.clone(),
         }
-        .issue(&context, Selector::from((heartbeat_key, range)));
+        .send_query(&context, Selector::from((heartbeat_key, range)));
     }
 }
 

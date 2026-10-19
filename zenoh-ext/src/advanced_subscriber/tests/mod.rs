@@ -28,7 +28,7 @@ use zenoh::{
 use zenoh_config::ModeDependentValue;
 
 use super::{
-    queries::{FragRecoveryAttempt, InitialRepliesHandler, QueryContext, SequencedRepliesHandler},
+    queries::{FragRecoveryAttempt, QueryContext, QueryScope, RepliesHandler},
     *,
 };
 use crate::{

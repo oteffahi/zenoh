@@ -170,7 +170,7 @@ async fn test_final_fragmented_sample_recovers_after_failure() {
                     .unwrap();
                 }
             } else {
-                SequencedRepliesHandler::periodic(&sub.statesref, id);
+                RepliesHandler::periodic(&sub.statesref, id);
                 let query = ztimeout!(cache.recv_async()).unwrap();
                 assert_eq!(query.parameters().get("_sn"), Some("1.."));
                 assert!(query.parameters().get("_fn").is_none());
@@ -346,7 +346,7 @@ async fn test_fragment_retry_waits_for_sample_recovery_query() {
     .unwrap();
     drop(ztimeout!(cache.recv_async()).unwrap());
     recovery_failed(&sub.statesref, id, 1).await;
-    SequencedRepliesHandler::periodic(&sub.statesref, id);
+    RepliesHandler::periodic(&sub.statesref, id);
     let sample_query = ztimeout!(cache.recv_async()).unwrap();
     assert!(sample_query.parameters().get("_fn").is_none());
     assert!(tokio::time::timeout(delay * 3, cache.recv_async())
@@ -566,7 +566,7 @@ async fn test_fragment_failure_preserves_other_partial_sample() {
         );
     }
     // Abandoned SN 1 must not make pending SN 2 look entirely missing.
-    SequencedRepliesHandler::recover_gap(&sub.statesref, id);
+    RepliesHandler::recover_gap(&sub.statesref, id);
     assert!(cache.try_recv().unwrap().is_none());
     assert!(sub.try_recv().unwrap().is_none());
     assert!(misses.try_recv().unwrap().is_none());
