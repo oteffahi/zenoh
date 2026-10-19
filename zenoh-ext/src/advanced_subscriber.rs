@@ -862,13 +862,8 @@ impl<Handler> AdvancedSubscriber<Handler> {
                 ),
             })
         });
-        let subscriber = runtime::declare_publications(
-            conf.session,
-            &key_expr,
-            conf.origin,
-            &statesref,
-            retransmission,
-        )?;
+        let subscriber =
+            runtime::declare_publications(conf.session, &key_expr, conf.origin, &statesref)?;
         tracing::debug!("Create AdvancedSubscriber{{key_expr: {}}}", key_expr);
         if let Some(history) = conf.history.as_ref() {
             runtime::query_history(&statesref, &key_expr, history);

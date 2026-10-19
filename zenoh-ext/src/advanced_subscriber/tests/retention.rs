@@ -27,7 +27,7 @@ use zenoh::{
 
 use super::{garbage_collect, on_publication};
 use crate::{
-    advanced_subscriber::{tests::frag_recovery_state, RecoveryConfig, State},
+    advanced_subscriber::{tests::frag_recovery_state, State},
     fragmentation::PendingSample,
     utils::WrappingSn,
 };
@@ -51,7 +51,6 @@ struct Fixture {
     key: KeyExpr<'static>,
     target: EntityGlobalId,
     other: EntityGlobalId,
-    recovery: Option<RecoveryConfig>,
 }
 
 impl Fixture {
@@ -76,8 +75,6 @@ impl Fixture {
             states,
             received,
             key,
-            recovery: recovery
-                .then(|| RecoveryConfig::default().fragments_recovery_delay(RECOVERY_DELAY)),
         }
     }
 
@@ -96,7 +93,7 @@ impl Fixture {
 
     fn publish(&self, sample: Sample) {
         // Exercise the real callback, including its post-arrival recovery lookup.
-        on_publication(&self.states, sample, self.recovery);
+        on_publication(&self.states, sample);
     }
 
     /// Restore a known LRU/time order without waiting for retention to elapse.

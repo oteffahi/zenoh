@@ -40,7 +40,7 @@ use zenoh::{
 use super::{
     handle_sample,
     queries::{reserve_queries, QueryContext, QueryScope, RepliesHandler},
-    HistoryConfig, RecoveryConfig, State,
+    HistoryConfig, State,
 };
 use crate::{
     advanced_cache::{ke_liveliness, KE_UHLC},
@@ -54,21 +54,20 @@ pub(super) fn declare_publications(
     key_expr: &KeyExpr<'_>,
     origin: Locality,
     statesref: &Arc<Mutex<State>>,
-    recovery: Option<RecoveryConfig>,
 ) -> ZResult<Subscriber<()>> {
     let publications = statesref.clone();
     let undeclared = statesref.clone();
     session
         .declare_subscriber(key_expr)
         .with(CallbackDrop {
-            callback: move |sample| on_publication(&publications, sample, recovery),
+            callback: move |sample| on_publication(&publications, sample),
             drop: move || on_undeclared(&undeclared),
         })
         .allowed_origin(origin)
         .wait()
 }
 
-fn on_publication(statesref: &Arc<Mutex<State>>, sample: Sample, recovery: Option<RecoveryConfig>) {
+fn on_publication(statesref: &Arc<Mutex<State>>, sample: Sample) {
     let mut lock = zlock!(statesref);
     let states = &mut *lock;
     let source_info = sample.source_info().cloned();
@@ -81,16 +80,14 @@ fn on_publication(statesref: &Arc<Mutex<State>>, sample: Sample, recovery: Optio
     let Some(source) = states.sequenced_states.peek_mut(&source_id) else {
         return;
     };
-    let request = if is_fragmented {
-        recovery.and_then(|conf| {
-            source.on_fragment(
-                statesref,
-                source_id,
-                info.source_sn().into(),
-                inserted.new_fragment_slot,
-                conf.frag_recovery_delay,
-            )
-        })
+    let request = if is_fragmented && states.retransmission {
+        source.on_fragment(
+            statesref,
+            source_id,
+            info.source_sn().into(),
+            inserted.new_fragment_slot,
+            states.frag_recovery_delay,
+        )
     } else {
         None
     };
