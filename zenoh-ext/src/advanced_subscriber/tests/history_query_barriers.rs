@@ -14,7 +14,74 @@
 
 use super::*;
 
-fn finish_sample_query(history: bool, fixture: &BufferedSource) {
+/// Session-backed fixture for query dispatch and reply-completion tests.
+struct QueryFixture {
+    states: Arc<Mutex<State>>,
+    received: Arc<Mutex<Vec<Sample>>>,
+    misses: Arc<Mutex<Vec<u32>>>,
+    id: EntityGlobalId,
+    key: KeyExpr<'static>,
+}
+
+impl QueryFixture {
+    fn new(session: &Session, depth: usize) -> Self {
+        let key = KeyExpr::try_from("test/ext/pending").unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let misses = Arc::new(Mutex::new(Vec::new()));
+        let states = frag_recovery_state(session, &key, received.clone());
+        {
+            let mut states = zlock!(states);
+            states.retransmission = false;
+            states.max_pending_samples = depth;
+            states.miss_handlers.insert(
+                0,
+                Callback::from({
+                    let misses = misses.clone();
+                    move |miss: Miss| misses.lock().unwrap().push(miss.nb())
+                }),
+            );
+        }
+        Self {
+            states,
+            received,
+            misses,
+            id: EntityGlobalId::new(session.zid(), 7),
+            key,
+        }
+    }
+
+    fn whole(&self, sn: u32, payload: &str) -> Sample {
+        whole(&self.key, self.id, sn, payload)
+    }
+
+    fn fragment(&self, sn: u32, num: u32, count: u32, payload: &str) -> Sample {
+        fragment(&self.key, self.id, sn, num, count, payload)
+    }
+
+    fn receive(&self, sample: Sample) -> SampleInsertion {
+        handle_sample(&mut zlock!(self.states), sample)
+    }
+
+    fn delivered(&self) -> Vec<u32> {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.source_info().unwrap().source_sn())
+            .collect()
+    }
+
+    fn payloads(&self) -> Vec<String> {
+        self.received
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.payload().try_to_string().unwrap().into_owned())
+            .collect()
+    }
+}
+
+fn finish_sample_query(history: bool, fixture: &QueryFixture) {
     drop(RepliesHandler {
         scope: if history {
             QueryScope::Global
@@ -31,7 +98,7 @@ fn finish_sample_query(history: bool, fixture: &BufferedSource) {
 async fn test_periodic_queries_coalesce_and_flush_unrecoverable_gap() {
     let session = isolated_session().await;
     let cache = ztimeout!(session.declare_queryable("test/ext/pending/@adv/**")).unwrap();
-    let fixture = BufferedSource::new(&session, 10);
+    let fixture = QueryFixture::new(&session, 10);
     zlock!(fixture.states).retransmission = true;
     fixture.receive(fixture.whole(0, "base"));
     fixture.receive(fixture.whole(2, "next"));
@@ -79,7 +146,7 @@ async fn test_periodic_queries_coalesce_and_flush_unrecoverable_gap() {
 async fn test_periodic_queries_respect_pending_queries() {
     let session = isolated_session().await;
     let cache = ztimeout!(session.declare_queryable("test/ext/pending/@adv/**")).unwrap();
-    let fixture = BufferedSource::new(&session, 10);
+    let fixture = QueryFixture::new(&session, 10);
     for (global_pending, source_pending) in [(1, 0), (0, 1)] {
         {
             let mut states = zlock!(fixture.states);
@@ -126,7 +193,7 @@ async fn test_query_flush_preserves_recoverable_partials() {
         for baseline in [0u32, u32::MAX - 2] {
             for gap in [false, true] {
                 for outcome in ["live", "reply", "empty", "timeout"] {
-                    let fixture = BufferedSource::new(&session, 10);
+                    let fixture = QueryFixture::new(&session, 10);
                     let partial = baseline.wrapping_add(1);
                     let successor = baseline.wrapping_add(if gap { 3 } else { 2 });
                     let frag =
@@ -272,7 +339,7 @@ async fn test_query_only_partial_before_complete_successor_is_recovered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_deferred_flush_does_not_skip_future_gap() {
     let session = isolated_session().await;
-    let fixture = BufferedSource::new(&session, 10);
+    let fixture = QueryFixture::new(&session, 10);
     {
         let mut states = zlock!(fixture.states);
         states.retransmission = true;
@@ -301,43 +368,44 @@ async fn test_deferred_flush_does_not_skip_future_gap() {
 }
 
 /// Resolving one barrier preserves another; eviction can resume a deferred skip.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_deferred_flush_multiple_barriers_and_eviction() {
-    let session = isolated_session().await;
+#[test]
+fn test_deferred_flush_multiple_barriers_and_eviction() {
     for evict in [false, true] {
-        let fixture = BufferedSource::new(&session, if evict { 2 } else { 10 });
-        {
-            let mut states = zlock!(fixture.states);
-            states.retransmission = true;
-            states.frag_recovery_delay = Duration::from_secs(60);
-            handle_sample(&mut states, fixture.whole(0, "single"));
-            handle_sample(&mut states, fixture.fragment(1, 0, 2, "ab"));
-            if evict {
-                handle_sample(&mut states, fixture.whole(3, "single"));
-            } else {
-                handle_sample(&mut states, fixture.fragment(3, 0, 2, "ab"));
-                handle_sample(&mut states, fixture.whole(5, "single"));
-            }
-            states.on_history_or_sample_recovery_finished(&fixture.states, &fixture.id);
-            if evict {
-                handle_sample(&mut states, fixture.fragment(4, 0, 2, "ab"));
-                let source = states.sequenced_states.peek(&fixture.id).unwrap();
-                assert_eq!(source.last_delivered, Some(WrappingSn(3)));
-                assert_eq!(source.pending_samples.len(), 1);
-                assert!(source.pending_samples.contains_key(&WrappingSn(4)));
-                assert!(source.gap_skip_through.is_none());
-            } else {
-                handle_sample(&mut states, fixture.fragment(1, 1, 2, "ab"));
-                let source = states.sequenced_states.peek(&fixture.id).unwrap();
-                assert_eq!(source.last_delivered, Some(WrappingSn(1)));
-                assert!(source.pending_samples[&WrappingSn(3)].is_incomplete());
-                assert_eq!(source.gap_skip_through, Some(WrappingSn(5)));
-                handle_sample(&mut states, fixture.fragment(3, 1, 2, "ab"));
-                let source = states.sequenced_states.peek(&fixture.id).unwrap();
-                assert_eq!(source.last_delivered, Some(WrappingSn(5)));
-                assert!(source.pending_samples.is_empty());
-                assert!(source.gap_skip_through.is_none());
-            }
+        let mut fixture = BufferedSource::new(if evict { 2 } else { 10 });
+        fixture.retransmission = true;
+        fixture.receive(fixture.whole(0, "single"));
+        fixture.receive(fixture.fragment(1, 0, 2, "ab"));
+        if evict {
+            fixture.receive(fixture.whole(3, "single"));
+        } else {
+            fixture.receive(fixture.fragment(3, 0, 2, "ab"));
+            fixture.receive(fixture.whole(5, "single"));
+        }
+        fixture.source.authorize_gap_skip();
+        fixture.source.drain_authorized_samples(
+            &fixture.callback,
+            &fixture.miss_handlers,
+            fixture.id,
+            fixture.retransmission,
+        );
+        if evict {
+            fixture.receive(fixture.fragment(4, 0, 2, "ab"));
+            let source = &fixture.source;
+            assert_eq!(source.last_delivered, Some(WrappingSn(3)));
+            assert_eq!(source.pending_samples.len(), 1);
+            assert!(source.pending_samples.contains_key(&WrappingSn(4)));
+            assert!(source.gap_skip_through.is_none());
+        } else {
+            fixture.receive(fixture.fragment(1, 1, 2, "ab"));
+            let source = &fixture.source;
+            assert_eq!(source.last_delivered, Some(WrappingSn(1)));
+            assert!(source.pending_samples[&WrappingSn(3)].is_incomplete());
+            assert_eq!(source.gap_skip_through, Some(WrappingSn(5)));
+            fixture.receive(fixture.fragment(3, 1, 2, "ab"));
+            let source = &fixture.source;
+            assert_eq!(source.last_delivered, Some(WrappingSn(5)));
+            assert!(source.pending_samples.is_empty());
+            assert!(source.gap_skip_through.is_none());
         }
         assert_eq!(
             *fixture.misses.lock().unwrap(),
@@ -348,7 +416,6 @@ async fn test_deferred_flush_multiple_barriers_and_eviction() {
             if evict { 2 } else { 4 }
         );
     }
-    ztimeout!(session.close()).unwrap();
 }
 
 /// Fragment completion cannot extend skip authority. Check both completion
@@ -358,7 +425,7 @@ async fn test_deferred_flush_overlapping_queries_and_boundary_extension() {
     let session = isolated_session().await;
     let cache = ztimeout!(session.declare_queryable("test/ext/pending/@adv/**")).unwrap();
     for (sample_query_first, extend) in [(false, false), (true, false), (true, true)] {
-        let fixture = BufferedSource::new(&session, 10);
+        let fixture = QueryFixture::new(&session, 10);
         let (generation, attempt) = {
             let mut states = zlock!(fixture.states);
             states.retransmission = true;
@@ -455,7 +522,7 @@ async fn test_query_completion_preserves_trailing_partial_samples() {
     let session = isolated_session().await;
     for history in [false, true] {
         for advance_past_gap in [false, true] {
-            let fixture = BufferedSource::new(&session, 10);
+            let fixture = QueryFixture::new(&session, 10);
             let tail_sn = if advance_past_gap { 3 } else { 1 };
             {
                 let mut states = zlock!(fixture.states);
@@ -583,7 +650,7 @@ async fn test_query_completion_recovers_trailing_partial_sample() {
 async fn test_query_completion_flushes_after_overlapping_fragment_query() {
     let session = isolated_session().await;
     for history_first in [false, true] {
-        let fixture = BufferedSource::new(&session, 10);
+        let fixture = QueryFixture::new(&session, 10);
         {
             let mut states = zlock!(fixture.states);
             states.global_pending_queries = 1;

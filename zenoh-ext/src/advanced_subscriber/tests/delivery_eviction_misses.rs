@@ -15,11 +15,10 @@
 use super::*;
 
 /// A retired watermark must not reject a new sample at its old half-range boundary.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_delivery_retires_eviction_watermark() {
-    let session = isolated_session().await;
+#[test]
+fn test_delivery_retires_eviction_watermark() {
     for baseline in [0u32, u32::MAX - 1] {
-        let fixture = BufferedSource::new(&session, 1);
+        let mut fixture = BufferedSource::new(1);
         let evicted = baseline.wrapping_add(1);
         let successor = baseline.wrapping_add(2);
         let half_range = evicted.wrapping_add(u32::MAX / 2);
@@ -28,20 +27,12 @@ async fn test_delivery_retires_eviction_watermark() {
             fixture.receive(fixture.fragment(sn, 0, 2, "a"));
         }
         fixture.receive(fixture.fragment(successor, 1, 2, "b"));
-        let watermark = zlock!(fixture.states)
-            .sequenced_states
-            .peek(&fixture.id)
-            .unwrap()
-            .last_evicted;
+        let watermark = fixture.source.last_evicted;
         for sn in [half_range, half_range.wrapping_add(1)] {
             fixture.receive(fixture.whole(sn, "new"));
         }
         assert_eq!(
-            zlock!(fixture.states)
-                .sequenced_states
-                .peek(&fixture.id)
-                .unwrap()
-                .last_delivered,
+            fixture.source.last_delivered,
             Some(WrappingSn(half_range.wrapping_add(1)))
         );
         assert_eq!(watermark, None, "delivery must retire last_evicted");
@@ -50,19 +41,15 @@ async fn test_delivery_retires_eviction_watermark() {
             [baseline, successor, half_range, half_range.wrapping_add(1)]
         );
     }
-    ztimeout!(session.close()).unwrap();
 }
 
 /// Late data must not recreate an evicted abandonment tombstone before delivery.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_evicted_abandoned_sample_stays_obsolete() {
-    let session = isolated_session().await;
-    let fixture = BufferedSource::new(&session, 2);
+#[test]
+fn test_evicted_abandoned_sample_stays_obsolete() {
+    let mut fixture = BufferedSource::new(2);
     fixture.receive(fixture.whole(0, "base"));
-    zlock!(fixture.states)
-        .sequenced_states
-        .peek_mut(&fixture.id)
-        .unwrap()
+    fixture
+        .source
         .pending_samples
         .insert(WrappingSn(1), PendingSample::Abandoned);
     for sn in [3, 4, 1] {
@@ -70,8 +57,7 @@ async fn test_evicted_abandoned_sample_stays_obsolete() {
     }
     fixture.receive(fixture.whole(1, "late whole sample"));
     {
-        let states = zlock!(fixture.states);
-        let source = states.sequenced_states.peek(&fixture.id).unwrap();
+        let source = &fixture.source;
         assert_eq!(source.last_evicted, Some(WrappingSn(1)));
         assert_eq!(
             source.pending_samples.keys().copied().collect::<Vec<_>>(),
@@ -80,29 +66,27 @@ async fn test_evicted_abandoned_sample_stays_obsolete() {
     }
     assert_eq!(fixture.received.lock().unwrap().len(), 1);
     assert!(fixture.misses.lock().unwrap().is_empty());
-    ztimeout!(session.close()).unwrap();
 }
 
 /// Preserve wraparound × put/delete × arrival-order coverage. With recovery off,
 /// a complete successor skips obsolete partials without waiting for eviction.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_delivery_discards_obsolete_partial_samples() {
-    let session = isolated_session().await;
+#[test]
+fn test_delivery_discards_obsolete_partial_samples() {
     for baseline in [0u32, u32::MAX - 2] {
         for delete in [false, true] {
             for successor_first in [false, true] {
-                let fixture = BufferedSource::new(&session, 10);
+                let mut fixture = BufferedSource::new(10);
                 let partial = baseline.wrapping_add(1);
                 let jump = baseline.wrapping_add(2);
                 let successor = baseline.wrapping_add(3);
                 fixture.receive(fixture.whole(baseline, "base"));
                 fixture.receive(fixture.fragment(partial, 0, 2, "lost"));
-                let complete_successor = || {
+                let complete_successor = |fixture: &mut BufferedSource| {
                     fixture.receive(fixture.fragment(successor, 0, 2, "ab"));
                     fixture.receive(fixture.fragment(successor, 1, 2, "cd"));
                 };
                 if successor_first {
-                    complete_successor();
+                    complete_successor(&mut fixture);
                 }
                 fixture.receive(if delete {
                     SampleBuilder::delete(fixture.key.clone())
@@ -112,7 +96,7 @@ async fn test_delivery_discards_obsolete_partial_samples() {
                     fixture.whole(jump, "jump")
                 });
                 if !successor_first {
-                    complete_successor();
+                    complete_successor(&mut fixture);
                 }
                 fixture.receive(fixture.fragment(partial, 1, 2, "late"));
                 fixture.receive(fixture.fragment(partial, 0, 2, "lost"));
@@ -130,35 +114,22 @@ async fn test_delivery_discards_obsolete_partial_samples() {
                     *fixture.misses.lock().unwrap(),
                     [if successor_first { 2 } else { 1 }]
                 );
-                assert!(zlock!(fixture.states)
-                    .sequenced_states
-                    .peek(&fixture.id)
-                    .unwrap()
-                    .pending_samples
-                    .is_empty());
+                assert!(fixture.source.pending_samples.is_empty());
             }
         }
     }
-    ztimeout!(session.close()).unwrap();
 }
 
 /// The depth-one history fast path establishes a newer baseline and retires partials.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_history_delivery_discards_obsolete_partial_samples() {
-    let session = isolated_session().await;
-    let fixture = BufferedSource::new(&session, 1);
-    zlock!(fixture.states).global_pending_queries = 1;
+#[test]
+fn test_history_delivery_discards_obsolete_partial_samples() {
+    let mut fixture = BufferedSource::new(1);
+    fixture.history_pending = true;
     fixture.receive(fixture.fragment(1, 0, 2, "partial"));
     fixture.receive(fixture.whole(2, "new"));
     assert_eq!(fixture.delivered(), [2]);
     assert!(fixture.misses.lock().unwrap().is_empty());
-    assert!(zlock!(fixture.states)
-        .sequenced_states
-        .peek(&fixture.id)
-        .unwrap()
-        .pending_samples
-        .is_empty());
-    ztimeout!(session.close()).unwrap();
+    assert!(fixture.source.pending_samples.is_empty());
 }
 
 /// Overflow must release all complete successors immediately after discarding
@@ -221,11 +192,10 @@ async fn test_pending_eviction_retries_ready_delivery_with_recovery() {
 }
 
 /// Delivery after eviction must still stop at a surviving recoverable partial.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_pending_eviction_preserves_recoverable_head() {
-    let session = isolated_session().await;
-    let fixture = BufferedSource::new(&session, 3);
-    zlock!(fixture.states).retransmission = true;
+#[test]
+fn test_pending_eviction_preserves_recoverable_head() {
+    let mut fixture = BufferedSource::new(3);
+    fixture.retransmission = true;
     fixture.receive(fixture.whole(0, "base"));
     for sn in [1, 2] {
         fixture.receive(fixture.fragment(sn, 0, 2, "a"));
@@ -234,8 +204,7 @@ async fn test_pending_eviction_preserves_recoverable_head() {
         fixture.receive(fixture.whole(sn, "complete"));
     }
     {
-        let states = zlock!(fixture.states);
-        let source = states.sequenced_states.peek(&fixture.id).unwrap();
+        let source = &fixture.source;
         assert_eq!(source.last_delivered, Some(WrappingSn(0)));
         assert_eq!(
             source
@@ -255,15 +224,13 @@ async fn test_pending_eviction_preserves_recoverable_head() {
     fixture.receive(fixture.fragment(2, 1, 2, "b"));
     assert_eq!(fixture.delivered(), [0, 2, 3, 4]);
     assert_eq!(*fixture.misses.lock().unwrap(), [1]);
-    ztimeout!(session.close()).unwrap();
 }
 
 /// Before the first baseline, eviction unblocks delivery without reporting a miss.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_pending_bound_unblocks_incomplete_head() {
-    let session = ztimeout!(zenoh::open(Config::default())).unwrap();
-    let fixture = BufferedSource::new(&session, 4);
-    zlock!(fixture.states).retransmission = true;
+#[test]
+fn test_pending_bound_unblocks_incomplete_head() {
+    let mut fixture = BufferedSource::new(4);
+    fixture.retransmission = true;
     fixture.receive(fixture.fragment(1, 0, 3, "ab"));
     fixture.receive(fixture.fragment(1, 2, 3, "ef"));
     for (sn, p0, p1, p2) in [
@@ -282,37 +249,25 @@ async fn test_pending_bound_unblocks_incomplete_head() {
     }
     assert_eq!(fixture.payloads(), ["abcdef", "ghijkl", "mnopqr", "stuvwx"]);
     assert!(fixture.misses.lock().unwrap().is_empty());
-    let mut states = zlock!(fixture.states);
-    let source = states.sequenced_states.get(&fixture.id).unwrap();
-    assert!(source.pending_samples.is_empty());
-    assert_eq!(source.last_delivered, Some(WrappingSn(5)));
+    assert!(fixture.source.pending_samples.is_empty());
+    assert_eq!(fixture.source.last_delivered, Some(WrappingSn(5)));
 }
 
 /// Incomplete eviction is silent until a later delivery crosses the gap.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_pending_bound_enforced() {
-    let session = ztimeout!(zenoh::open(Config::default())).unwrap();
-    let fixture = BufferedSource::new(&session, 4);
+#[test]
+fn test_pending_bound_enforced() {
+    let mut fixture = BufferedSource::new(4);
     for sn in 0..10 {
         fixture.receive(fixture.fragment(sn, 0, 3, "x"));
     }
     assert!(fixture.misses.lock().unwrap().is_empty());
     assert!(fixture.received.lock().unwrap().is_empty());
-    assert_eq!(
-        zlock!(fixture.states)
-            .sequenced_states
-            .get(&fixture.id)
-            .unwrap()
-            .pending_samples
-            .len(),
-        4
-    );
+    assert_eq!(fixture.source.pending_samples.len(), 4);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_miss_reported_once_on_crossing_delivery() {
-    let session = ztimeout!(zenoh::open(Config::default())).unwrap();
-    let fixture = BufferedSource::new(&session, 4);
+#[test]
+fn test_miss_reported_once_on_crossing_delivery() {
+    let mut fixture = BufferedSource::new(4);
     fixture.receive(fixture.whole(0, "base"));
     // Every fragment crosses the gap; only assembled delivery reports it.
     for (num, payload) in [(0, "ab"), (1, "cd"), (2, "ef")] {
@@ -322,10 +277,9 @@ async fn test_miss_reported_once_on_crossing_delivery() {
     assert_eq!(*fixture.misses.lock().unwrap(), [1]);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_miss_jump_count_on_delivery() {
-    let session = ztimeout!(zenoh::open(Config::default())).unwrap();
-    let fixture = BufferedSource::new(&session, 4);
+#[test]
+fn test_miss_jump_count_on_delivery() {
+    let mut fixture = BufferedSource::new(4);
     fixture.receive(fixture.whole(0, "base"));
     fixture.receive(fixture.whole(3, "jump"));
     assert_eq!(fixture.payloads(), ["base", "jump"]);

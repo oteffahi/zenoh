@@ -91,50 +91,44 @@ pub(super) fn frag_recovery_state(
     }))
 }
 
-/// Bounded buffering without retransmission, recording deliveries and misses.
-fn pending_bound_state(
-    session: &Session,
-    max_pending_samples: usize,
-    received: Arc<Mutex<Vec<Sample>>>,
-    misses: Arc<Mutex<Vec<u32>>>,
-) -> Arc<Mutex<State>> {
-    let statesref = frag_recovery_state(
-        session,
-        &KeyExpr::try_from("test/ext/pending").unwrap(),
-        received,
-    );
-    {
-        let mut states = zlock!(statesref);
-        states.retransmission = false;
-        states.max_pending_samples = max_pending_samples;
-        states.miss_handlers.insert(
-            0,
-            Callback::from(move |miss: Miss| misses.lock().unwrap().push(miss.nb())),
-        );
-    }
-    statesref
-}
-
-/// Small fixture for deterministic arrival/delivery tests. Network recovery
-/// tests keep their real queryables and reply lifetimes in the test itself.
+/// Synchronous source-policy fixture with recorded deliveries and misses.
 struct BufferedSource {
-    states: Arc<Mutex<State>>,
+    source: SequencedSource,
+    callback: Callback<Sample>,
+    miss_handlers: HashMap<usize, Callback<Miss>>,
     received: Arc<Mutex<Vec<Sample>>>,
     misses: Arc<Mutex<Vec<u32>>>,
     id: EntityGlobalId,
     key: KeyExpr<'static>,
+    history_pending: bool,
+    retransmission: bool,
+    max_pending_samples: usize,
 }
 
 impl BufferedSource {
-    fn new(session: &Session, depth: usize) -> Self {
+    fn new(depth: usize) -> Self {
         let received = Arc::new(Mutex::new(Vec::new()));
         let misses = Arc::new(Mutex::new(Vec::new()));
         Self {
-            states: pending_bound_state(session, depth, received.clone(), misses.clone()),
+            source: SequencedSource::default(),
+            callback: Callback::from({
+                let received = received.clone();
+                move |sample: Sample| received.lock().unwrap().push(sample)
+            }),
+            miss_handlers: HashMap::from([(
+                0,
+                Callback::from({
+                    let misses = misses.clone();
+                    move |miss: Miss| misses.lock().unwrap().push(miss.nb())
+                }),
+            )]),
             received,
             misses,
-            id: EntityGlobalId::new(session.zid(), 7),
+            id: EntityGlobalId::new("1".parse().unwrap(), 7),
             key: KeyExpr::try_from("test/ext/pending").unwrap(),
+            history_pending: false,
+            retransmission: false,
+            max_pending_samples: depth,
         }
     }
 
@@ -146,8 +140,25 @@ impl BufferedSource {
         fragment(&self.key, self.id, sn, num, count, payload)
     }
 
-    fn receive(&self, sample: Sample) -> SampleInsertion {
-        handle_sample(&mut zlock!(self.states), sample)
+    fn receive(&mut self, sample: Sample) {
+        let info = sample.source_info().unwrap().clone();
+        self.source
+            .receive(
+                sample,
+                &info,
+                &ArrivalContext {
+                    delivery: DeliveryContext {
+                        callback: &self.callback,
+                        miss_handlers: &self.miss_handlers,
+                        source_id: self.id,
+                    },
+                    history_pending: self.history_pending,
+                    retransmission: self.retransmission,
+                    max_pending_samples: self.max_pending_samples,
+                    max_fragments: MAX_FRAGMENTS_DEFAULT,
+                },
+            )
+            .unwrap();
     }
 
     fn delivered(&self) -> Vec<u32> {
