@@ -12,6 +12,13 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
+//! Per-source arrival, buffering, and delivery policy.
+//!
+//! Arrivals are classified relative to the last delivered sequence number. The
+//! next eligible delivery can be later: eviction and abandonment allow skipping
+//! retired samples, while completed history/sample queries grant bounded authority
+//! to skip unseen samples. Only delivery reports misses and advances the baseline.
+
 use std::{
     collections::{btree_map, BTreeMap, HashMap},
     sync::Arc,
@@ -27,7 +34,47 @@ use zenoh::{
 };
 
 use super::Miss;
-use crate::{fragmentation::FragmentedSample, utils::WrappingSn};
+use crate::{
+    fragmentation::{validate_fragment_metadata, FragInsertError, PendingSample},
+    utils::WrappingSn,
+};
+
+/// Whether insertion created a sequence-number entry. Only a new entry needs to
+/// arm recovery; fragment progress and duplicate handling belong to the assembly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PendingInsertion {
+    NewEntry,
+    ExistingEntry,
+}
+
+/// Valid duplicates count as activity even when nothing is inserted. Explicitly
+/// retired input does not; malformed fragments are returned as validation errors.
+pub(super) enum ReceiveOutcome {
+    Accepted(Option<PendingInsertion>),
+    Ignored,
+}
+
+pub(super) struct DeliveryContext<'a> {
+    pub(super) callback: &'a Callback<Sample>,
+    pub(super) miss_handlers: &'a HashMap<usize, Callback<Miss>>,
+    pub(super) source_id: EntityGlobalId,
+}
+
+pub(super) struct ArrivalContext<'a> {
+    pub(super) delivery: DeliveryContext<'a>,
+    pub(super) history_pending: bool,
+    pub(super) retransmission: bool,
+    pub(super) max_pending_samples: usize,
+    pub(super) max_fragments: u32,
+}
+
+enum Arrival {
+    Retired,
+    InitialHistory,
+    OldOrDuplicate,
+    FirstOrConsecutive,
+    Ahead,
+}
 
 pub(super) struct SequencedSource {
     /// Identifies this source state so old fragment queries cannot affect a
@@ -45,7 +92,7 @@ pub(super) struct SequencedSource {
     /// Delivery can skip missing sequence numbers up to this value, but still
     /// waits for unfinished queries and fragments it can recover.
     pub(super) gap_skip_through: Option<WrappingSn>,
-    pub(super) pending_samples: BTreeMap<WrappingSn, FragmentedSample>,
+    pub(super) pending_samples: BTreeMap<WrappingSn, PendingSample>,
     pub(super) latest_access: Instant,
     pub(super) periodic_task: Option<AbortOnDropHandle<()>>,
     /// Periodically checks all samples for missing fragments. Stops when none
@@ -72,39 +119,242 @@ impl Default for SequencedSource {
 }
 
 impl SequencedSource {
-    /// Add a sample or fragment to the buffer. Return `Ok(true)` if its sequence
-    /// number was not already buffered, or `Err(())` if the fragment is invalid.
+    fn classify_arrival(&self, sn: WrappingSn, history_pending: bool) -> Arrival {
+        if self.last_evicted.is_some_and(|last| sn <= last)
+            || self
+                .pending_samples
+                .get(&sn)
+                .is_some_and(PendingSample::is_abandoned)
+        {
+            return Arrival::Retired;
+        }
+        match self.last_delivered {
+            None if history_pending => Arrival::InitialHistory,
+            None => Arrival::FirstOrConsecutive,
+            Some(last) if sn == last + 1 => Arrival::FirstOrConsecutive,
+            Some(last) if sn > last => Arrival::Ahead,
+            Some(_) => Arrival::OldOrDuplicate,
+        }
+    }
+
+    /// Process a sequenced arrival once. Accepted activity is recorded by the
+    /// caller alongside LRU promotion. Its optional insertion describes only
+    /// fragmented input; whole samples never arm fragment recovery.
+    pub(super) fn receive(
+        &mut self,
+        sample: Sample,
+        info: &SourceInfo,
+        context: &ArrivalContext<'_>,
+    ) -> Result<ReceiveOutcome, FragInsertError> {
+        let sn = info.source_sn().into();
+        let inserted = match self.classify_arrival(sn, context.history_pending) {
+            Arrival::Retired => return Ok(ReceiveOutcome::Ignored),
+            Arrival::InitialHistory => self.receive_initial_history(sample, info, context),
+            // Delivered duplicates have no assembly left to validate them.
+            // Check their advertised metadata before counting them as activity.
+            Arrival::OldOrDuplicate => match sample.frag_info() {
+                Some(fi) => validate_fragment_metadata(
+                    fi.frag_num(),
+                    fi.frag_count(),
+                    context.max_fragments,
+                )
+                .map(|()| None),
+                None => Ok(None),
+            },
+            Arrival::FirstOrConsecutive => self.receive_in_order(sample, info, context),
+            Arrival::Ahead => self.receive_ahead(sample, info, context),
+        };
+        if !context.history_pending {
+            self.drain_authorized_samples(
+                context.delivery.callback,
+                context.delivery.miss_handlers,
+                context.delivery.source_id,
+                context.retransmission,
+            );
+        }
+        inserted.map(ReceiveOutcome::Accepted)
+    }
+
+    fn receive_initial_history(
+        &mut self,
+        sample: Sample,
+        info: &SourceInfo,
+        context: &ArrivalContext<'_>,
+    ) -> Result<Option<PendingInsertion>, FragInsertError> {
+        if sample.frag_info().is_some() {
+            // Invalid history fragments neither enforce the bound nor pop.
+            let inserted = self.insert_sample(sample, info, context.max_fragments)?;
+            self.enforce_arrival_limit(context);
+            return Ok(Some(inserted));
+        }
+        let sn = info.source_sn().into();
+        if context.max_pending_samples == 1 {
+            // History depth one delivers whole samples immediately.
+            self.deliver_ready(Some((sn, sample)), &context.delivery);
+        } else {
+            self.pending_samples
+                .insert(sn, PendingSample::single(sample));
+            self.enforce_arrival_limit(context);
+        }
+        Ok(None)
+    }
+
+    fn receive_in_order(
+        &mut self,
+        sample: Sample,
+        info: &SourceInfo,
+        context: &ArrivalContext<'_>,
+    ) -> Result<Option<PendingInsertion>, FragInsertError> {
+        let sn = info.source_sn().into();
+        if sample.frag_info().is_some() {
+            let inserted = self.insert_sample(sample, info, context.max_fragments)?;
+            // In-order fragments enforce BEFORE advancing delivery. Eviction
+            // may itself deliver a complete sample or unblock the next one.
+            self.enforce_arrival_limit(context);
+            let ready = if context.retransmission {
+                self.advance_ready()
+            } else {
+                self.take_complete(sn).map(|sample| (sn, sample))
+            };
+            self.deliver_ready(ready, &context.delivery);
+            return Ok(Some(inserted));
+        }
+        if context.retransmission && !self.pending_samples.is_empty() {
+            // Even a whole sample waits for earlier recoverable fragments.
+            self.pending_samples
+                .insert(sn, PendingSample::single(sample));
+            self.enforce_arrival_limit(context);
+            let ready = self.advance_ready();
+            self.deliver_ready(ready, &context.delivery);
+        } else {
+            self.deliver_ready(Some((sn, sample)), &context.delivery);
+        }
+        Ok(None)
+    }
+
+    fn receive_ahead(
+        &mut self,
+        sample: Sample,
+        info: &SourceInfo,
+        context: &ArrivalContext<'_>,
+    ) -> Result<Option<PendingInsertion>, FragInsertError> {
+        if !context.retransmission {
+            return self
+                .receive_ahead_without_recovery(sample, info, context)
+                .map(|()| None);
+        }
+        let inserted = if sample.frag_info().is_some() {
+            self.insert_sample(sample, info, context.max_fragments)
+                .map(Some)
+        } else {
+            self.pending_samples
+                .insert(info.source_sn().into(), PendingSample::single(sample));
+            Ok(None)
+        };
+        // Ahead arrivals advance BEFORE enforcing the bound, including rejected
+        // fragments. A later completion can unblock an evicted or failed head.
+        let ready = self.advance_ready();
+        self.deliver_ready(ready, &context.delivery);
+        self.enforce_arrival_limit(context);
+        inserted
+    }
+
+    fn receive_ahead_without_recovery(
+        &mut self,
+        sample: Sample,
+        info: &SourceInfo,
+        context: &ArrivalContext<'_>,
+    ) -> Result<(), FragInsertError> {
+        let sn = info.source_sn().into();
+        if sample.frag_info().is_some() {
+            // Preserve enforcement and completion checks even after rejection.
+            let inserted = self.insert_sample(sample, info, context.max_fragments);
+            self.enforce_arrival_limit(context);
+            let ready = self.take_complete(sn).map(|sample| (sn, sample));
+            self.deliver_ready(ready, &context.delivery);
+            inserted.map(|_| ())
+        } else {
+            self.deliver_ready(Some((sn, sample)), &context.delivery);
+            Ok(())
+        }
+    }
+
+    fn enforce_arrival_limit(&mut self, context: &ArrivalContext<'_>) {
+        self.enforce_pending_limit(
+            context.delivery.callback,
+            context.delivery.miss_handlers,
+            context.delivery.source_id,
+            context.max_pending_samples,
+        );
+    }
+
+    fn deliver_ready(
+        &mut self,
+        ready: Option<(WrappingSn, Sample)>,
+        context: &DeliveryContext<'_>,
+    ) {
+        if let Some((sn, sample)) = ready {
+            self.deliver_and_drain(
+                sample,
+                sn,
+                context.callback,
+                context.miss_handlers,
+                context.source_id,
+            );
+        }
+    }
+
+    /// Add a sample or fragment to the buffer. Return validation errors to the
+    /// arrival boundary, which logs each rejection once.
     pub(super) fn insert_sample(
         &mut self,
         sample: Sample,
         source_info: &SourceInfo,
         max_fragments: u32,
-    ) -> Result<bool, ()> {
+    ) -> Result<PendingInsertion, FragInsertError> {
         let sn = source_info.source_sn().into();
         let Some(fi) = sample.frag_info() else {
-            let new = !self.pending_samples.contains_key(&sn);
-            self.pending_samples
-                .insert(sn, FragmentedSample::single(sample));
-            return Ok(new);
+            return Ok(
+                if self
+                    .pending_samples
+                    .insert(sn, PendingSample::single(sample))
+                    .is_none()
+                {
+                    PendingInsertion::NewEntry
+                } else {
+                    PendingInsertion::ExistingEntry
+                },
+            );
         };
         let (frag_num, frag_count) = (fi.frag_num(), fi.frag_count());
-        let result = match self.pending_samples.entry(sn) {
+        self.insert_fragment(sample, sn, frag_num, frag_count, max_fragments)
+    }
+
+    fn insert_fragment(
+        &mut self,
+        sample: Sample,
+        sn: WrappingSn,
+        frag_num: u32,
+        frag_count: u32,
+        max_fragments: u32,
+    ) -> Result<PendingInsertion, FragInsertError> {
+        validate_fragment_metadata(frag_num, frag_count, max_fragments)?;
+        match self.pending_samples.entry(sn) {
             btree_map::Entry::Vacant(entry) => {
-                // FIXME: incorrect semantics for .map usage
-                FragmentedSample::from_first_fragment(sample, frag_num, frag_count, max_fragments)
-                    .map(|sample| {
-                        entry.insert(sample);
-                        true
-                    })
+                let pending = PendingSample::from_first_fragment(
+                    sample,
+                    frag_num,
+                    frag_count,
+                    max_fragments,
+                )?;
+                entry.insert(pending);
+                Ok(PendingInsertion::NewEntry)
             }
-            btree_map::Entry::Occupied(mut entry) => entry
-                .get_mut()
-                .insert(sample, frag_num, frag_count)
-                .map(|()| false),
-        };
-        result.map_err(|error| {
-            tracing::warn!("AdvancedSubscriber: rejected fragment (sn={sn}): {error:?}");
-        })
+            btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().insert(sample, frag_num, frag_count)?;
+                Ok(PendingInsertion::ExistingEntry)
+            }
+        }
     }
 
     /// Remove the oldest samples until the buffer fits the configured limit.
@@ -131,7 +381,7 @@ impl SequencedSource {
                 );
                 // Removing an incomplete sample may let us deliver the next one.
                 // Try now, even if the buffer is already small enough.
-                if let Some((sn, sample)) = self.pop_next_ready() {
+                if let Some((sn, sample)) = self.advance_ready() {
                     self.deliver_and_drain(sample, sn, callback, miss_handlers, source_id);
                 }
             }
@@ -158,19 +408,31 @@ impl SequencedSource {
         while self
             .pending_samples
             .get(&next)
-            .is_some_and(FragmentedSample::is_abandoned)
+            .is_some_and(PendingSample::is_abandoned)
         {
             next += 1;
         }
         Some(next)
     }
 
-    /// Take the next sample if it is complete. Wait if that sample has not
-    /// arrived or still has fragments we can recover.
-    pub(super) fn pop_next_ready(&mut self) -> Option<(WrappingSn, Sample)> {
-        self.abandon_failed_head();
+    /// Select the next complete sample without abandoning or removing anything.
+    pub(super) fn next_ready(&self) -> Option<WrappingSn> {
         let sn = self.next_expected()?;
-        self.take_complete(sn).map(|sample| (sn, sample))
+        self.pending_samples.get(&sn)?.is_complete().then_some(sn)
+    }
+
+    /// Abandon failed blocking assemblies, then take the next ready sample.
+    /// Selection alone is available through `next_ready`.
+    pub(super) fn advance_ready(&mut self) -> Option<(WrappingSn, Sample)> {
+        self.abandon_failed_head();
+        let sn = self.next_ready()?;
+        let sample = self
+            .pending_samples
+            .remove(&sn)
+            .expect("selected pending sample exists")
+            .into_sample()
+            .expect("selected pending sample is complete");
+        Some((sn, sample))
     }
 
     /// Give up recovering the oldest incomplete sample if recovery failed and
@@ -197,7 +459,7 @@ impl SequencedSource {
             {
                 return;
             }
-            self.pending_samples.insert(sn, FragmentedSample::Abandoned);
+            self.pending_samples.insert(sn, PendingSample::Abandoned);
         }
     }
 
@@ -208,7 +470,7 @@ impl SequencedSource {
                     entry
                         .remove()
                         .into_sample()
-                        .expect("into_sample should not fail when FragmentedSample is complete"),
+                        .expect("into_sample should not fail when PendingSample is complete"),
                 );
             }
         }
@@ -225,44 +487,55 @@ impl SequencedSource {
     ) {
         let mut ready = Some((source_sn.into(), sample));
         while let Some((sn, sample)) = ready {
-            // Count missed samples between this delivery and the previous one.
-            // This also counts samples we discarded or gave up recovering.
-            // Before the first delivery, we do not know which samples were missed.
-            if let Some(last) = self.last_delivered {
-                if sn > last + 1 {
-                    let missed = sn - last - 1;
-                    tracing::info!("Sample missed: missed {missed} samples from {source_id:?}.");
-                    for callback in miss_handlers.values() {
-                        callback.call(Miss {
-                            source: source_id,
-                            nb: missed,
-                        });
-                    }
-                }
-            }
-            callback.call(sample);
-            self.last_delivered = Some(sn);
-            // last_delivered now rejects these old samples, so last_evicted is
-            // no longer needed. Keeping it could reject new samples later as
-            // the wrapping sequence counter advances.
-            if self.last_evicted.is_some_and(|evicted| sn >= evicted) {
-                self.last_evicted = None;
-            }
-            while self
-                .pending_samples
-                .first_key_value()
-                .is_some_and(|(key, _)| *key <= sn)
-            {
-                self.pending_samples.pop_first();
-            }
-            ready = self.pop_next_ready();
+            self.deliver_one(sample, sn, callback, miss_handlers, source_id);
+            ready = self.advance_ready();
         }
         if !self
             .pending_samples
             .values()
-            .any(FragmentedSample::is_incomplete)
+            .any(PendingSample::is_incomplete)
         {
             self.frag_recovery_task = None;
+        }
+    }
+
+    /// The sole sequenced-delivery path owns miss accounting, the baseline,
+    /// eviction-watermark retirement, and removal of obsolete buffered entries.
+    fn deliver_one(
+        &mut self,
+        sample: Sample,
+        sn: WrappingSn,
+        callback: &Callback<Sample>,
+        miss_handlers: &HashMap<usize, Callback<Miss>>,
+        source_id: EntityGlobalId,
+    ) {
+        // Count discarded and abandoned samples only when delivery crosses them.
+        // Before the first delivery, we do not know which samples were missed.
+        if let Some(last) = self.last_delivered {
+            if sn > last + 1 {
+                let missed = sn - last - 1;
+                tracing::info!("Sample missed: missed {missed} samples from {source_id:?}.");
+                for callback in miss_handlers.values() {
+                    callback.call(Miss {
+                        source: source_id,
+                        nb: missed,
+                    });
+                }
+            }
+        }
+        callback.call(sample);
+        self.last_delivered = Some(sn);
+        // The baseline now rejects these old samples. Keeping last_evicted
+        // could reject new samples later as the wrapping counter advances.
+        if self.last_evicted.is_some_and(|evicted| sn >= evicted) {
+            self.last_evicted = None;
+        }
+        while self
+            .pending_samples
+            .first_key_value()
+            .is_some_and(|(key, _)| *key <= sn)
+        {
+            self.pending_samples.pop_first();
         }
     }
 
@@ -357,6 +630,30 @@ impl Default for TimestampedSource {
 }
 
 impl TimestampedSource {
+    pub(super) fn receive(
+        &mut self,
+        sample: Sample,
+        callback: &Callback<Sample>,
+        global_pending_queries: u64,
+        max_pending_samples: usize,
+    ) {
+        let timestamp = *sample.timestamp().expect("timestamped source");
+        if self.last_delivered.map(|t| t < timestamp).unwrap_or(true) {
+            if (global_pending_queries == 0 && self.pending_queries == 0)
+                || max_pending_samples == 1
+            {
+                self.last_delivered = Some(timestamp);
+                callback.call(sample);
+            } else {
+                self.pending_samples.entry(timestamp).or_insert(sample);
+                if self.pending_samples.len() >= max_pending_samples {
+                    self.flush(Some(callback));
+                }
+            }
+        }
+        self.latest_access = Instant::now();
+    }
+
     pub(super) fn flush(&mut self, callback: Option<&Callback<Sample>>) {
         let Some(callback) = callback else {
             return;
@@ -387,7 +684,7 @@ mod tests {
             last_evicted: Option<T>,
             pending_queries: u64,
             pending_flush: Option<WrappingSn>,
-            pending_samples: BTreeMap<T, FragmentedSample>,
+            pending_samples: BTreeMap<T, PendingSample>,
             latest_access: Instant,
             periodic_task: Option<AbortOnDropHandle<()>>,
             frag_recovery_task: Option<AbortOnDropHandle<()>>,
@@ -396,14 +693,14 @@ mod tests {
         use std::mem::size_of;
         assert!(size_of::<SequencedSource>() <= size_of::<PreviousSource<WrappingSn>>());
         assert!(size_of::<TimestampedSource>() < size_of::<PreviousSource<Timestamp>>());
-        assert!(size_of::<Sample>() <= size_of::<FragmentedSample>());
+        assert!(size_of::<Sample>() <= size_of::<PendingSample>());
         println!(
             "source sizes: sequenced {} -> {}, timestamped {} -> {}; buffered sample {} -> {}",
             size_of::<PreviousSource<WrappingSn>>(),
             size_of::<SequencedSource>(),
             size_of::<PreviousSource<Timestamp>>(),
             size_of::<TimestampedSource>(),
-            size_of::<FragmentedSample>(),
+            size_of::<PendingSample>(),
             size_of::<Sample>()
         );
     }

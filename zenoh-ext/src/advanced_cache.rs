@@ -15,7 +15,6 @@ use std::{
     collections::VecDeque,
     future::{IntoFuture, Ready},
     num::NonZeroUsize,
-    ops::{Bound, RangeBounds},
     sync::{Arc, RwLock},
 };
 
@@ -27,12 +26,12 @@ use zenoh::{
     },
     liveliness::LivelinessToken,
     qos::{CongestionControl, Priority},
-    query::{Queryable, ZenohParameters},
+    query::{Parameters, Query, Queryable, TimeRange, ZenohParameters},
     sample::{Locality, Sample, SampleBuilder},
     Resolvable, Result as ZResult, Session, Wait, KE_ADV_PREFIX, KE_STARSTAR,
 };
 
-use crate::{fragmentation::FragmentedSample, utils::WrappingSn};
+use crate::advanced_query::QueryRange;
 
 pub(crate) static KE_UHLC: &keyexpr = ke!("uhlc");
 #[zenoh_macros::unstable]
@@ -198,29 +197,139 @@ impl IntoFuture for AdvancedCacheBuilder<'_, '_, '_> {
     }
 }
 
-#[zenoh_macros::unstable]
-fn decode_range(range: &str) -> (Bound<WrappingSn>, Bound<WrappingSn>) {
-    let mut split = range.split("..");
-    let start = split
-        .next()
-        .and_then(|s| s.parse::<WrappingSn>().ok().map(Bound::Included))
-        .unwrap_or(Bound::Unbounded);
-    let end = split
-        .next()
-        .map(|s| {
-            s.parse::<WrappingSn>()
-                .ok()
-                .map(Bound::Included)
-                .unwrap_or(Bound::Unbounded)
-        })
-        .unwrap_or(start);
-    (start, end)
+/// A complete publication occupies one cache entry, regardless of fragment count.
+// Keep unfragmented samples inline to avoid an extra allocation.
+#[allow(clippy::large_enum_variant)]
+enum CachedPublication {
+    Single(Sample),
+    /// All fragments of one publication, in fragment-number order.
+    Fragmented(Vec<Sample>),
+}
+
+impl CachedPublication {
+    fn fragments(&self) -> &[Sample] {
+        match self {
+            Self::Single(sample) => std::slice::from_ref(sample),
+            Self::Fragmented(fragments) => fragments,
+        }
+    }
+}
+
+struct CacheQuery {
+    sequence_range: QueryRange,
+    fragment_range: QueryRange,
+    time_range: Option<TimeRange>,
+    max: Option<u32>,
+}
+
+impl CacheQuery {
+    fn from_parameters(parameters: &Parameters<'_>) -> Self {
+        Self {
+            sequence_range: QueryRange::from_parameter(parameters.get("_sn")),
+            fragment_range: QueryRange::from_parameter(parameters.get("_fn")),
+            time_range: parameters.time_range().and_then(Result::ok),
+            max: parameters.get("_max").and_then(|s| s.parse().ok()),
+        }
+    }
+
+    fn matches_fragment(&self, fragment: &Sample) -> bool {
+        self.fragment_range.is_unbounded()
+            || fragment
+                .frag_info()
+                .is_some_and(|info| self.fragment_range.contains(info.frag_num()))
+    }
+
+    fn matches_publication(&self, publication: &CachedPublication) -> bool {
+        let head = publication.fragments().first();
+        if !(self.sequence_range.is_unbounded()
+            || head
+                .and_then(|fragment| fragment.source_info())
+                .is_some_and(|info| self.sequence_range.contains(info.source_sn())))
+        {
+            return false;
+        }
+        if let (Some(time_range), Some(timestamp)) = (
+            self.time_range.as_ref(),
+            head.and_then(|fragment| fragment.timestamp()),
+        ) {
+            if !time_range.contains(timestamp.get_time().to_system_time()) {
+                return false;
+            }
+        }
+        self.fragment_range.is_unbounded()
+            || publication
+                .fragments()
+                .iter()
+                .any(|fragment| self.matches_fragment(fragment))
+    }
+
+    fn for_each_matching_publication(
+        &self,
+        queue: &VecDeque<CachedPublication>,
+        mut reply: impl FnMut(&CachedPublication),
+    ) {
+        if self.max == Some(0) {
+            return;
+        }
+        let publications = queue
+            .iter()
+            .filter(|publication| self.matches_publication(publication));
+        if let Some(max) = self.max {
+            // Count matching publications, not individual fragments. Keep the
+            // newest matches in a bounded buffer, then reply in ascending order.
+            let mut selected = VecDeque::new();
+            for publication in publications {
+                selected.push_front(publication);
+                selected.truncate(max as usize);
+            }
+            for publication in selected.into_iter().rev() {
+                reply(publication);
+            }
+        } else {
+            for publication in publications {
+                reply(publication);
+            }
+        }
+    }
+}
+
+fn reply_publication(
+    query: &Query,
+    publication: &CachedPublication,
+    selection: &CacheQuery,
+    replies: &RepliesConfig,
+) {
+    for frag in publication
+        .fragments()
+        .iter()
+        .filter(|frag| selection.matches_fragment(frag))
+    {
+        if let Err(e) = query
+            .reply_sample(
+                SampleBuilder::from(frag.clone())
+                    .congestion_control(replies.congestion_control)
+                    .priority(replies.priority)
+                    .express(replies.is_express)
+                    .into(),
+            )
+            .wait()
+        {
+            tracing::warn!("AdvancedCache{{}} Error replying to query: {}", e);
+        } else {
+            tracing::trace!(
+                "AdvancedCache{{}} Replied to query {} with Sample{{info:{:?}, ts:{:?}}}",
+                query.selector(),
+                frag.source_info(),
+                frag.timestamp()
+            );
+        }
+    }
 }
 
 /// [`AdvancedCache`].
 #[zenoh_macros::unstable]
 pub struct AdvancedCache {
-    cache: Arc<RwLock<VecDeque<FragmentedSample>>>,
+    cache: Arc<RwLock<VecDeque<CachedPublication>>>,
     max_samples: NonZeroUsize,
     _queryable: Queryable<()>,
     _token: Option<LivelinessToken>,
@@ -242,7 +351,7 @@ impl AdvancedCache {
             &key_expr,
             conf.history,
         );
-        let cache = Arc::new(RwLock::new(VecDeque::<FragmentedSample>::new()));
+        let cache = Arc::new(RwLock::new(VecDeque::<CachedPublication>::new()));
 
         // declare the queryable that will answer to queries on cache
         let queryable = conf
@@ -253,93 +362,20 @@ impl AdvancedCache {
                 let cache = cache.clone();
                 move |query| {
                     tracing::trace!("AdvancedCache{{}} Handle query {}", query.selector());
-                    let srange = query
-                        .parameters()
-                        .get("_sn")
-                        .map(decode_range)
-                        .unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                    let frange = query
-                        .parameters()
-                        .get("_fn")
-                        .map(decode_range)
-                        .unwrap_or((Bound::Unbounded, Bound::Unbounded));
-                    let max = query
-                        .parameters()
-                        .get("_max")
-                        .and_then(|s| s.parse::<u32>().ok());
+                    let selection = CacheQuery::from_parameters(query.parameters());
                     if let Ok(queue) = cache.read() {
-                        let srange_unbounded = srange == (Bound::Unbounded, Bound::Unbounded);
-                        let frange_unbounded = frange == (Bound::Unbounded, Bound::Unbounded);
-                        let frag_matches = |frag: &Sample| {
-                            frange_unbounded
-                                || frag
-                                    .frag_info()
-                                    .is_some_and(|i| frange.contains(&i.frag_num()))
-                        };
-                        let sample_matches = |sample: &&FragmentedSample| {
-                            let head = sample.iter_frags().next();
-                            if !(srange_unbounded
-                                || head
-                                    .and_then(|frag| frag.source_info())
-                                    .is_some_and(|si| srange.contains(&si.source_sn())))
-                            {
-                                return false;
-                            }
-                            if let (Some(Ok(time_range)), Some(timestamp)) = (
-                                query.parameters().time_range(),
-                                head.and_then(|frag| frag.timestamp()),
-                            ) {
-                                if !time_range.contains(timestamp.get_time().to_system_time()) {
-                                    return false;
-                                }
-                            }
-                            frange_unbounded || sample.iter_frags().any(frag_matches)
-                        };
-                        let reply_frag = |frag: &Sample| {
-                            if let Err(e) = query
-                                .reply_sample(
-                                    SampleBuilder::from(frag.clone())
-                                        .congestion_control(
-                                            conf.history.replies_config.congestion_control,
-                                        )
-                                        .priority(conf.history.replies_config.priority)
-                                        .express(conf.history.replies_config.is_express)
-                                        .into(),
-                                )
-                                .wait()
-                            {
-                                tracing::warn!("AdvancedCache{{}} Error replying to query: {}", e);
-                            } else {
-                                tracing::trace!(
-                                    "AdvancedCache{{}} Replied to query {} with Sample{{info:{:?}, ts:{:?}}}",
-                                    query.selector(),
-                                    frag.source_info(),
-                                    frag.timestamp()
-                                );
-                            }
-                        };
-
-                        if let Some(max) = max {
-                            // Enfore max by accumulating matches into a bounded buffer
-                            let mut samples: VecDeque<&FragmentedSample> = VecDeque::new();
-                            for sample in queue.iter().filter(sample_matches) {
-                                samples.push_front(sample);
-                                samples.truncate(max as usize);
-                            }
-                            for sample in samples.drain(..).rev() {
-                                for frag in sample.iter_frags().filter(|f| frag_matches(f)) {
-                                    reply_frag(frag);
-                                }
-                            }
-                        } else {
-                            for sample in queue.iter().filter(sample_matches) {
-                                for frag in sample.iter_frags().filter(|f| frag_matches(f)) {
-                                    reply_frag(frag);
-                                }
-                            }
-                        }
+                        selection.for_each_matching_publication(&queue, |publication| {
+                            reply_publication(
+                                &query,
+                                publication,
+                                &selection,
+                                &conf.history.replies_config,
+                            );
+                        });
                     } else {
-                        tracing::error!("AdvancedCache{{}} Unable to take AdvancedPublisher cache read lock");
+                        tracing::error!(
+                            "AdvancedCache{{}} Unable to take AdvancedPublisher cache read lock"
+                        );
                     }
                 }
             })
@@ -371,23 +407,20 @@ impl AdvancedCache {
 
     #[zenoh_macros::unstable]
     pub(crate) fn cache_sample(&self, sample: Sample) {
-        if let Ok(mut queue) = self.cache.write() {
-            if queue.len() >= self.max_samples.get() {
-                queue.pop_front();
-            }
-            queue.push_back(FragmentedSample::single(sample));
-        } else {
-            tracing::error!("AdvancedCache{{}} Unable to take AdvancedPublisher cache write lock");
-        }
+        self.cache_publication(CachedPublication::Single(sample));
     }
 
     #[zenoh_macros::unstable]
     pub(crate) fn cache_fragments(&self, fragments: Vec<Sample>) {
+        self.cache_publication(CachedPublication::Fragmented(fragments));
+    }
+
+    fn cache_publication(&self, publication: CachedPublication) {
         if let Ok(mut queue) = self.cache.write() {
             if queue.len() >= self.max_samples.get() {
                 queue.pop_front();
             }
-            queue.push_back(FragmentedSample::from_complete_vec(fragments));
+            queue.push_back(publication);
         } else {
             tracing::error!("AdvancedCache{{}} Unable to take AdvancedPublisher cache write lock");
         }
@@ -396,78 +429,142 @@ impl AdvancedCache {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Bound;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
-    use super::decode_range;
-    use crate::utils::WrappingSn;
+    use zenoh::{
+        query::{ConsolidationMode, ReplyKeyExpr},
+        Config, Session, Wait,
+    };
+
+    use crate::{AdvancedPublisherBuilderExt, CacheConfig, MissDetectionConfig};
+
+    const KEY: &str = "test/advanced_cache/publications";
+
+    fn open_session() -> Session {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        zenoh::open(config).wait().unwrap()
+    }
+
+    fn query_cache(session: &Session, parameters: &str) -> Vec<(u32, Option<u32>)> {
+        session
+            .get(format!("{KEY}/@adv/**?{parameters}"))
+            .consolidation(ConsolidationMode::None)
+            .accept_replies(ReplyKeyExpr::Any)
+            .timeout(Duration::from_secs(5))
+            .wait()
+            .unwrap()
+            .into_iter()
+            .map(|reply| {
+                let sample = reply.into_result().unwrap();
+                (
+                    sample.source_info().unwrap().source_sn(),
+                    sample.frag_info().map(|info| info.frag_num()),
+                )
+            })
+            .collect()
+    }
 
     #[test]
-    fn decode_range_bounded() {
+    fn cache_max_counts_publications_and_preserves_reply_order() {
+        let session = open_session();
+        let publisher = session
+            .declare_publisher(KEY)
+            .cache(CacheConfig::default().max_samples(5))
+            .sample_miss_detection(MissDetectionConfig::default())
+            .fragmentation(2)
+            .wait()
+            .unwrap();
+        for payload in ["old", "abcd", "ef", "ghijkl", "mn"] {
+            publisher.put(payload).wait().unwrap();
+        }
+
         assert_eq!(
-            decode_range("2..3"),
-            (
-                Bound::Included(WrappingSn(2)),
-                Bound::Included(WrappingSn(3))
-            )
+            query_cache(&session, "_max=2"),
+            [(3, Some(0)), (3, Some(1)), (3, Some(2)), (4, None)]
         );
-    }
-
-    #[test]
-    fn decode_range_start_only() {
         assert_eq!(
-            decode_range("2.."),
-            (Bound::Included(WrappingSn(2)), Bound::Unbounded)
+            query_cache(&session, "_max=3"),
+            [
+                (2, None),
+                (3, Some(0)),
+                (3, Some(1)),
+                (3, Some(2)),
+                (4, None)
+            ]
         );
+        assert!(query_cache(&session, "_max=0").is_empty());
+        session.close().wait().unwrap();
     }
 
     #[test]
-    fn decode_range_end_only() {
+    fn cache_fragment_filter_applies_before_publication_limit() {
+        let session = open_session();
+        let publisher = session
+            .declare_publisher(KEY)
+            .cache(CacheConfig::default().max_samples(5))
+            .sample_miss_detection(MissDetectionConfig::default())
+            .fragmentation(2)
+            .wait()
+            .unwrap();
+        for payload in ["old", "abcd", "ef", "ghijkl", "mn"] {
+            publisher.put(payload).wait().unwrap();
+        }
+
         assert_eq!(
-            decode_range("..3"),
-            (Bound::Unbounded, Bound::Included(WrappingSn(3)))
+            query_cache(&session, "_fn=1..2;_max=2"),
+            [(1, Some(1)), (3, Some(1)), (3, Some(2))]
         );
-    }
-
-    #[test]
-    fn decode_range_unbounded() {
-        assert_eq!(decode_range(".."), (Bound::Unbounded, Bound::Unbounded));
-    }
-
-    #[test]
-    fn decode_range_empty() {
-        assert_eq!(decode_range(""), (Bound::Unbounded, Bound::Unbounded));
-    }
-
-    // A bare value with no `..` separator falls back to `unwrap_or(start)`,
-    // yielding a singleton range `Included(v)..=Included(v)`.
-    #[test]
-    fn decode_range_single_value() {
         assert_eq!(
-            decode_range("2"),
-            (
-                Bound::Included(WrappingSn(2)),
-                Bound::Included(WrappingSn(2))
-            )
+            query_cache(&session, "_sn=0..1;_fn=1;_max=1"),
+            [(1, Some(1))]
         );
+        assert_eq!(
+            query_cache(&session, "_fn=2..;_max=invalid"),
+            [(3, Some(2))]
+        );
+        assert_eq!(query_cache(&session, "_fn=abc..def;_max=1"), [(4, None)]);
+        assert!(query_cache(&session, "_fn=9;_max=1").is_empty());
+        session.close().wait().unwrap();
     }
 
-    // A non-numeric end fails to parse and degrades to `Unbounded` rather than
-    // panicking, so callers receive a half-open range instead of an error.
     #[test]
-    fn decode_range_malformed_end() {
-        assert_eq!(
-            decode_range("2..abc"),
-            (Bound::Included(WrappingSn(2)), Bound::Unbounded)
-        );
-    }
+    fn cache_complete_batch_is_queryable_from_first_fragment() {
+        let session = open_session();
+        let cached_fragments = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = session
+            .declare_subscriber(KEY)
+            .callback({
+                let session = session.clone();
+                let cached_fragments = cached_fragments.clone();
+                move |fragment| {
+                    if fragment
+                        .frag_info()
+                        .is_some_and(|info| info.frag_num() == 0)
+                    {
+                        *cached_fragments.lock().unwrap() = query_cache(&session, "_sn=0;_max=1");
+                    }
+                }
+            })
+            .wait()
+            .unwrap();
+        let publisher = session
+            .declare_publisher(KEY)
+            .cache(CacheConfig::default())
+            .sample_miss_detection(MissDetectionConfig::default())
+            .fragmentation(2)
+            .wait()
+            .unwrap();
 
-    // A non-numeric start fails to parse to `Unbounded`; the well-formed end is
-    // still honoured.
-    #[test]
-    fn decode_range_malformed_start() {
+        publisher.put("abcdef").wait().unwrap();
         assert_eq!(
-            decode_range("abc..3"),
-            (Bound::Unbounded, Bound::Included(WrappingSn(3)))
+            *cached_fragments.lock().unwrap(),
+            [(0, Some(0)), (0, Some(1)), (0, Some(2))]
         );
+        session.close().wait().unwrap();
     }
 }

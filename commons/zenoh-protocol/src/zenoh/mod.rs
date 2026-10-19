@@ -184,10 +184,18 @@ pub mod ext {
     /// ~  original_ts  ~  if T==1
     /// +---------------+
     /// ```
+    ///
+    /// Fragment metadata is carried separately from source identity. Advanced
+    /// pub/sub groups fragments by source identifier and sequence number, then
+    /// validates the count and zero-based index when assembling the publication.
+    /// The length-delimited extension allows readers to skip unknown trailing data.
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
     pub struct FragInfoType<const ID: u8> {
+        /// Number of fragments in the original publication.
         pub fcount: u32,
+        /// Zero-based index within that publication.
         pub fnum: u32,
+        /// Optional original publication timestamp, distinct from a fragment's timestamp.
         pub original_timestamp: Option<Timestamp>,
     }
 

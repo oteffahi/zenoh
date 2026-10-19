@@ -36,10 +36,19 @@
 //!
 //! The [`AdvancedPublisher`] and [`AdvancedSubscriber`] provide advanced pub/sub
 //! functionalities, including support for message history, recovery, and more.
+//!
+//! With [`AdvancedPublisherBuilder::fragmentation`], a publication is sent as
+//! several independently delivered fragments sharing one source sequence number.
+//! [`AdvancedSubscriber`] reassembles them into one sample. Enabling its
+//! [`recovery`](AdvancedSubscriberBuilder::recovery) lets it request missing
+//! fragments from the publisher's [`cache`](AdvancedPublisherBuilder::cache).
+//! History limits and miss notifications count publications, not their fragments.
 #[cfg(feature = "unstable")]
 mod advanced_cache;
 #[cfg(feature = "unstable")]
 mod advanced_publisher;
+#[cfg(feature = "unstable")]
+mod advanced_query;
 #[cfg(feature = "unstable")]
 mod advanced_subscriber;
 #[cfg(feature = "unstable")]

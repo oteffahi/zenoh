@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2026 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,6 +11,15 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+//! Local assembly and recovery state for one pending publication.
+//!
+//! [`PendingSample`] distinguishes abandoned, whole, and fragmented publications.
+//! [`FragmentAssembly`] stores fragments, tracks genuine progress, and selects
+//! missing ranges for one recovery attempt at a time. Complete assemblies retain
+//! their fragments and attempt identity until delivery, so late duplicates can
+//! still replace fragments. The subscriber owns per-source ordering, query
+//! dispatch, and the decision to abandon a publication that blocks delivery.
+
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -45,13 +54,38 @@ pub(crate) fn fragment_count(payload_len: usize, size: usize) -> ZResult<u32> {
 }
 
 /// First and last fragment numbers to request, both included.
-/// `None` means the start or end of the sample.
-pub(crate) type FragRange = (Option<u32>, Option<u32>);
+///
+/// Open bounds use `None`, preserving the recovery query's wire representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FragRange {
+    /// First fragment, or the start of the sample when absent.
+    pub(crate) start: Option<u32>,
+    /// Last fragment, or the end of the sample when absent.
+    pub(crate) end: Option<u32>,
+}
 
+impl FragRange {
+    pub(crate) const fn new(start: Option<u32>, end: Option<u32>) -> Self {
+        Self { start, end }
+    }
+}
+
+/// What prompted a check for missing fragments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryTrigger {
+    /// Query holes before received fragments, leaving the tail time to arrive.
+    FragmentArrival,
+    /// Also query the tail once no new fragment has arrived for the delay.
+    TimerTick,
+}
+
+/// Recovery attempt state retained alongside the assembly until delivery.
 #[derive(Debug, Clone, Default)]
 pub(crate) enum FragmentRecovery {
+    /// No attempt is running and recovery may start immediately.
     #[default]
     Idle,
+    /// Identity of the running attempt, used to reject stale completions.
     InFlight(Arc<()>),
     /// When the last attempt failed. Wait before retrying. Give up on the
     /// sample only if it prevents delivery of a newer complete sample.
@@ -74,105 +108,91 @@ impl FragmentRecovery {
     }
 }
 
+/// A publication buffered until it can be delivered in source order.
+// Keeps unfragmented samples inline to avoid an extra allocation.
 #[derive(Debug, Clone)]
-// Keep unfragmented samples inline to avoid an extra allocation.
 #[allow(clippy::large_enum_variant)]
-pub(crate) enum FragmentedSample {
+pub(crate) enum PendingSample {
     /// Recovery failed, so we gave up on this sample to deliver a newer one.
     /// Keep this entry to reject late fragments until a newer sample is delivered
     /// or the buffer limit forces its removal.
     Abandoned,
-    Single(Sample),
-    Partial {
-        // TODO: `from_first_fragment` eagerly allocates `vec![None; frag_count]`
-        //       (~600 KB per slot at the 4096-fragment cap, scaled by `max_pending_samples`),
-        //       allowing a payload-less attacker to inflate memory by declaring
-        //       a large `frag_count` on each first fragment.
-        //       A sparse `BTreeMap<u32, Sample>`, or deferring allocation until
-        //       a non-first fragment arrives, should be considered.
-        frags: Vec<Option<Sample>>,
-        /// When we last received a fragment we did not already have.
-        /// Used to decide when to query for the remaining fragments at the end.
-        /// Receiving a duplicate does not update this time.
-        last_progress: Instant,
-        recovery: FragmentRecovery,
-    },
+    /// A complete publication received without multi-fragment assembly.
+    Whole(Sample),
+    /// An assembly that may be incomplete or waiting for ordered delivery.
+    Fragmented(FragmentAssembly),
 }
 
+/// Fragment storage and local recovery bookkeeping for one publication.
+///
+/// Completing an assembly does not turn it into [`PendingSample::Whole`]: its
+/// fragments remain replaceable by duplicates until [`PendingSample::into_sample`].
+#[derive(Debug, Clone)]
+pub(crate) struct FragmentAssembly {
+    // TODO: `from_first_fragment` eagerly allocates `vec![None; frag_count]`
+    //       (~600 KB per slot at the 4096-fragment cap, scaled by `max_pending_samples`),
+    //       allowing a payload-less attacker to inflate memory by declaring
+    //       a large `frag_count` on each first fragment.
+    //       A sparse `BTreeMap<u32, Sample>`, or deferring allocation until
+    //       a non-first fragment arrives, should be considered.
+    /// Fragments indexed by their advertised fragment number.
+    pub(crate) frags: Vec<Option<Sample>>,
+    /// When we last received a fragment we did not already have.
+    /// Used to decide when to query for the remaining fragments at the end.
+    /// Receiving a duplicate does not update this time.
+    pub(crate) last_progress: Instant,
+    pub(crate) recovery: FragmentRecovery,
+}
+
+/// Reasons a fragment cannot create or update a pending publication.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) enum FragInsertError {
+    /// The publication was abandoned and rejects late fragments.
     Abandoned,
+    /// The fragment number is outside `0..frag_count`.
     InvalidFragNum { frag_count: u32, frag_num: u32 },
+    /// The advertised fragment count is zero.
     InvalidFragCount { frag_count: u32 },
+    /// The advertised fragment count differs from the pending publication's count.
     CountMismatch { expected: u32, got: u32 },
+    /// The first fragment advertises more fragments than the subscriber permits.
     ExceedsMax { frag_count: u32, max: u32 },
 }
 
-impl FragmentedSample {
+impl PendingSample {
     #[inline]
     pub(crate) fn single(sample: Sample) -> Self {
-        Self::Single(sample)
+        Self::Whole(sample)
     }
 
-    /// Build a `FragmentedSample` from a vector of already-complete fragments.
-    /// The caller guarantees all fragments are present and in-order.
-    pub(crate) fn from_complete_vec(fragments: Vec<Sample>) -> Self {
-        match fragments.len() {
-            0 => Self::Partial {
-                frags: Vec::new(),
-                last_progress: Instant::now(),
-                recovery: FragmentRecovery::Idle,
-            },
-            1 => Self::Single(fragments.into_iter().next().unwrap()),
-            _ => Self::Partial {
-                frags: fragments.into_iter().map(Some).collect(),
-                last_progress: Instant::now(),
-                recovery: FragmentRecovery::Idle,
-            },
-        }
-    }
-
-    /// Create the first slot for a fragmented sample.
+    /// Create a pending publication from its first received fragment.
+    ///
+    /// # Errors
+    /// * [`FragInsertError::InvalidFragCount`] if `frag_count == 0`.
+    /// * [`FragInsertError::InvalidFragNum`] if `frag_num >= frag_count`.
+    /// * [`FragInsertError::ExceedsMax`] if `frag_count > max_fragments`.
     pub(crate) fn from_first_fragment(
         sample: Sample,
         frag_num: u32,
         frag_count: u32,
         max_fragments: u32,
     ) -> Result<Self, FragInsertError> {
-        if frag_count == 0 {
-            return Err(FragInsertError::InvalidFragCount { frag_count });
-        }
-        if frag_num >= frag_count {
-            return Err(FragInsertError::InvalidFragNum {
-                frag_count,
-                frag_num,
-            });
-        }
-        if frag_count > max_fragments {
-            return Err(FragInsertError::ExceedsMax {
-                frag_count,
-                max: max_fragments,
-            });
-        }
+        validate_fragment_metadata(frag_num, frag_count, max_fragments)?;
         if frag_count == 1 {
-            return Ok(Self::Single(sample));
+            return Ok(Self::Whole(sample));
         }
-        let mut frags = vec![None; frag_count as usize];
-        frags[frag_num as usize] = Some(sample);
-        Ok(Self::Partial {
-            frags,
-            last_progress: Instant::now(),
-            recovery: FragmentRecovery::Idle,
-        })
+        Ok(Self::Fragmented(FragmentAssembly::from_first_fragment(
+            sample, frag_num, frag_count,
+        )))
     }
 
     #[inline]
     pub(crate) fn is_complete(&self) -> bool {
         match self {
             Self::Abandoned => false,
-            Self::Single(_) => true,
-            Self::Partial { frags, .. } => !frags.is_empty() && frags.iter().all(Option::is_some),
+            Self::Whole(_) => true,
+            Self::Fragmented(assembly) => assembly.is_complete(),
         }
     }
 
@@ -181,30 +201,21 @@ impl FragmentedSample {
     }
 
     pub(crate) fn is_incomplete(&self) -> bool {
-        matches!(self, Self::Partial { .. }) && !self.is_complete()
+        matches!(self, Self::Fragmented(assembly) if !assembly.is_complete())
     }
 
     pub(crate) fn recovery_matches(&self, token: &Arc<()>) -> bool {
-        matches!(self, Self::Partial { recovery: FragmentRecovery::InFlight(current), .. } if Arc::ptr_eq(current, token))
+        matches!(self, Self::Fragmented(assembly) if assembly.recovery_matches(token))
     }
 
     pub(crate) fn is_retry(&self) -> bool {
-        matches!(
-            self,
-            Self::Partial {
-                recovery: FragmentRecovery::FailedAt(_),
-                ..
-            }
-        )
+        matches!(self, Self::Fragmented(assembly) if assembly.is_retry())
     }
 
     /// We can give up on this sample only if recovery failed and no new fragment
     /// has arrived since. Receiving a new fragment gives it another chance.
     pub(crate) fn can_abandon(&self) -> bool {
-        self.is_incomplete()
-            && matches!(self, Self::Partial {
-                recovery: FragmentRecovery::FailedAt(failed_at), last_progress, ..
-            } if last_progress <= failed_at)
+        matches!(self, Self::Fragmented(assembly) if assembly.can_abandon())
     }
 
     /// Find missing fragments to query and mark a recovery attempt as running.
@@ -212,77 +223,26 @@ impl FragmentedSample {
     /// or no fragments need to be queried yet.
     ///
     /// A received fragment triggers queries for missing earlier fragments.
-    /// Timer ticks also set `include_stalled_tail` to query missing fragments at
-    /// the end of the sample, once no new fragment has arrived for `delay`.
+    /// Timer ticks also query missing fragments at the end of the sample, once
+    /// no new fragment has arrived for `delay`.
     pub(crate) fn prepare_recovery(
         &mut self,
         delay: Duration,
-        include_stalled_tail: bool,
+        trigger: RecoveryTrigger,
     ) -> Option<(Vec<FragRange>, Arc<()>)> {
-        let Self::Partial {
-            frags,
-            last_progress,
-            recovery,
-        } = self
-        else {
+        let Self::Fragmented(assembly) = self else {
             return None;
         };
-        if !recovery.can_start(delay) {
-            return None;
-        }
-        let include_tail = include_stalled_tail && last_progress.elapsed() >= delay;
-        let mut ranges = missing_ranges_impl(frags);
-        if !include_tail && ranges.last().is_some_and(|range| range.1.is_none()) {
-            ranges.pop();
-        }
-        if ranges.is_empty() {
-            return None;
-        }
-        Some((ranges, recovery.start()))
+        assembly.prepare_recovery(delay, trigger)
     }
 
     /// Mark the attempt as failed only if fragments it requested are still missing.
     /// Other fragments may still be arriving through publications.
     pub(crate) fn finish_recovery(&mut self, token: &Arc<()>, ranges: &[FragRange]) -> bool {
-        let Self::Partial {
-            frags, recovery, ..
-        } = self
-        else {
+        let Self::Fragmented(assembly) = self else {
             return false;
         };
-        if !matches!(recovery, FragmentRecovery::InFlight(current) if Arc::ptr_eq(current, token)) {
-            return false;
-        }
-        let failed = ranges.iter().any(|(start, end)| {
-            let start = start.unwrap_or(0) as usize;
-            let end = end.map(|n| n as usize + 1).unwrap_or(frags.len());
-            frags[start..end].iter().any(Option::is_none)
-        });
-        *recovery = if failed {
-            FragmentRecovery::FailedAt(Instant::now())
-        } else {
-            FragmentRecovery::Idle
-        };
-        failed
-    }
-
-    /// Iterate over all fragments. For a `Single` sample yields one element.
-    ///
-    /// For a [`Self::Partial`] sample with out-of-order fragments this yields
-    /// only the fragments that have arrived so far, in fragment-number order.
-    #[inline]
-    pub(crate) fn iter_frags(&self) -> FragsIter<'_> {
-        match self {
-            Self::Abandoned => FragsIter {
-                inner: FragsIterInner::Single(None),
-            },
-            Self::Single(s) => FragsIter {
-                inner: FragsIterInner::Single(Some(s)),
-            },
-            Self::Partial { frags, .. } => FragsIter {
-                inner: FragsIterInner::Partial(frags.iter()),
-            },
-        }
+        assembly.finish_recovery(token, ranges)
     }
 
     /// Insert a fragment into this slot.
@@ -291,59 +251,32 @@ impl FragmentedSample {
     /// the missing-tail recovery timer.
     ///
     /// # Errors
-    /// * `InvalidFragNum` if `frag_num >= frag_count`.
-    /// * `InvalidFragCount` if `frag_count == 0`.
-    /// * `CountMismatch` if the incoming `frag_count` disagrees with the slot.
-    /// * `Abandoned` if recovery already gave up on this slot.
+    /// * [`FragInsertError::InvalidFragCount`] if `frag_count == 0`.
+    /// * [`FragInsertError::InvalidFragNum`] if `frag_num >= frag_count`.
+    /// * [`FragInsertError::CountMismatch`] if the incoming count disagrees with the slot.
+    /// * [`FragInsertError::Abandoned`] if recovery already gave up on this slot.
     pub(crate) fn insert(
         &mut self,
         sample: Sample,
         frag_num: u32,
         frag_count: u32,
     ) -> Result<(), FragInsertError> {
-        if frag_count == 0 {
-            return Err(FragInsertError::InvalidFragCount { frag_count });
-        }
-        if frag_num >= frag_count {
-            return Err(FragInsertError::InvalidFragNum {
-                frag_count,
-                frag_num,
-            });
-        }
+        validate_fragment(frag_num, frag_count)?;
         match self {
             Self::Abandoned => Err(FragInsertError::Abandoned),
-            Self::Single(_) => {
+            Self::Whole(current) => {
                 if frag_count == 1 {
-                    *self = Self::Single(sample);
+                    *current = sample;
                     return Ok(());
                 }
-                // A Single only exists when the sample was advertised as a
-                // single fragment (or assembled from a complete vector).  A
-                // later fragment claiming a different count is inconsistent.
+                // Whole samples have no multi-fragment assembly. A later
+                // fragment claiming a different count is inconsistent.
                 Err(FragInsertError::CountMismatch {
                     expected: 1,
                     got: frag_count,
                 })
             }
-            Self::Partial {
-                frags,
-                last_progress,
-                ..
-            } => {
-                if frags.len() != frag_count as usize {
-                    return Err(FragInsertError::CountMismatch {
-                        expected: frags.len() as u32,
-                        got: frag_count,
-                    });
-                }
-                let slot = &mut frags[frag_num as usize];
-                let made_progress = slot.is_none();
-                *slot = Some(sample);
-                if made_progress {
-                    *last_progress = Instant::now();
-                }
-                Ok(())
-            }
+            Self::Fragmented(assembly) => assembly.insert(sample, frag_num, frag_count),
         }
     }
 
@@ -351,488 +284,166 @@ impl FragmentedSample {
     pub(crate) fn into_sample(self) -> Option<Sample> {
         match self {
             Self::Abandoned => None,
-            Self::Single(s) => Some(s),
-            Self::Partial { frags, .. } => {
-                if !frags.iter().all(Option::is_some) {
-                    return None;
-                }
-                let mut iter = frags.into_iter();
-                let first = iter.next()??;
-                let mut payload = ZBytes::writer();
-                payload.append(first.payload().clone());
-                for frag in iter {
-                    let frag = frag?;
-                    payload.append(frag.payload().clone());
-                }
-                Some(first.with_payload(payload.finish()))
-            }
+            Self::Whole(sample) => Some(sample),
+            Self::Fragmented(assembly) => assembly.into_sample(),
         }
     }
 }
 
-pub(crate) struct FragsIter<'a> {
-    inner: FragsIterInner<'a>,
-}
-
-enum FragsIterInner<'a> {
-    Single(Option<&'a Sample>),
-    Partial(::std::slice::Iter<'a, Option<Sample>>),
-}
-
-impl<'a> Iterator for FragsIter<'a> {
-    type Item = &'a Sample;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.inner {
-            FragsIterInner::Single(s) => s.take(),
-            FragsIterInner::Partial(iter) => iter.find_map(|f| f.as_ref()),
+impl FragmentAssembly {
+    /// The caller has validated the metadata and requires multiple fragments.
+    fn from_first_fragment(sample: Sample, frag_num: u32, frag_count: u32) -> Self {
+        let mut frags = vec![None; frag_count as usize];
+        frags[frag_num as usize] = Some(sample);
+        Self {
+            frags,
+            last_progress: Instant::now(),
+            recovery: FragmentRecovery::Idle,
         }
     }
+
+    fn is_complete(&self) -> bool {
+        !self.frags.is_empty() && self.frags.iter().all(Option::is_some)
+    }
+
+    fn recovery_matches(&self, token: &Arc<()>) -> bool {
+        matches!(&self.recovery, FragmentRecovery::InFlight(current) if Arc::ptr_eq(current, token))
+    }
+
+    fn is_retry(&self) -> bool {
+        matches!(self.recovery, FragmentRecovery::FailedAt(_))
+    }
+
+    fn can_abandon(&self) -> bool {
+        !self.is_complete()
+            && matches!(&self.recovery, FragmentRecovery::FailedAt(failed_at)
+                if self.last_progress <= *failed_at)
+    }
+
+    fn prepare_recovery(
+        &mut self,
+        delay: Duration,
+        trigger: RecoveryTrigger,
+    ) -> Option<(Vec<FragRange>, Arc<()>)> {
+        if !self.recovery.can_start(delay) {
+            return None;
+        }
+        let include_tail =
+            trigger == RecoveryTrigger::TimerTick && self.last_progress.elapsed() >= delay;
+        let mut ranges = missing_ranges_impl(&self.frags);
+        if !include_tail && ranges.last().is_some_and(|range| range.end.is_none()) {
+            ranges.pop();
+        }
+        if ranges.is_empty() {
+            return None;
+        }
+        Some((ranges, self.recovery.start()))
+    }
+
+    fn finish_recovery(&mut self, token: &Arc<()>, ranges: &[FragRange]) -> bool {
+        if !self.recovery_matches(token) {
+            return false;
+        }
+        let failed = ranges.iter().any(|range| {
+            let start = range.start.unwrap_or(0) as usize;
+            let end = range
+                .end
+                .map(|n| n as usize + 1)
+                .unwrap_or(self.frags.len());
+            self.frags[start..end].iter().any(Option::is_none)
+        });
+        self.recovery = if failed {
+            FragmentRecovery::FailedAt(Instant::now())
+        } else {
+            FragmentRecovery::Idle
+        };
+        failed
+    }
+
+    /// Insert validated fragment metadata, preserving progress on duplicates.
+    fn insert(
+        &mut self,
+        sample: Sample,
+        frag_num: u32,
+        frag_count: u32,
+    ) -> Result<(), FragInsertError> {
+        if self.frags.len() != frag_count as usize {
+            return Err(FragInsertError::CountMismatch {
+                expected: self.frags.len() as u32,
+                got: frag_count,
+            });
+        }
+        let slot = &mut self.frags[frag_num as usize];
+        let made_progress = slot.is_none();
+        *slot = Some(sample);
+        if made_progress {
+            self.last_progress = Instant::now();
+        }
+        Ok(())
+    }
+
+    fn into_sample(self) -> Option<Sample> {
+        if !self.is_complete() {
+            return None;
+        }
+        let mut iter = self.frags.into_iter();
+        let first = iter.next()??;
+        let mut payload = ZBytes::writer();
+        payload.append(first.payload().clone());
+        for frag in iter {
+            let frag = frag?;
+            payload.append(frag.payload().clone());
+        }
+        Some(first.with_payload(payload.finish()))
+    }
+}
+
+/// Validate advertised metadata without allocating an assembly or source state.
+pub(crate) fn validate_fragment_metadata(
+    frag_num: u32,
+    frag_count: u32,
+    max_fragments: u32,
+) -> Result<(), FragInsertError> {
+    validate_fragment(frag_num, frag_count)?;
+    if frag_count > max_fragments {
+        return Err(FragInsertError::ExceedsMax {
+            frag_count,
+            max: max_fragments,
+        });
+    }
+    Ok(())
+}
+
+fn validate_fragment(frag_num: u32, frag_count: u32) -> Result<(), FragInsertError> {
+    if frag_count == 0 {
+        return Err(FragInsertError::InvalidFragCount { frag_count });
+    }
+    if frag_num >= frag_count {
+        return Err(FragInsertError::InvalidFragNum {
+            frag_count,
+            frag_num,
+        });
+    }
+    Ok(())
 }
 
 fn missing_ranges_impl(frags: &[Option<Sample>]) -> Vec<FragRange> {
-    let mut missing_ranges: Vec<FragRange> = vec![];
+    let mut missing_ranges = Vec::new();
+    let mut hole_start = None;
     for (i, frag) in frags.iter().enumerate() {
-        if missing_ranges.is_empty() {
-            if frag.is_none() {
-                missing_ranges.push((Some(i as u32), None));
-            }
-        } else {
-            let last_index = missing_ranges.len() - 1;
-            if frag.is_none() {
-                if missing_ranges[last_index].1.is_some() {
-                    missing_ranges.push((Some(i as u32), None));
-                }
-            } else if missing_ranges[last_index].0.is_some()
-                && missing_ranges[last_index].1.is_none()
-            {
-                missing_ranges[last_index].1 = Some((i - 1) as u32);
-            }
+        if frag.is_none() {
+            hole_start.get_or_insert(i as u32);
+            continue;
         }
+        if let Some(start) = hole_start.take() {
+            missing_ranges.push(FragRange::new(Some(start), Some((i - 1) as u32)));
+        }
+    }
+    if let Some(start) = hole_start {
+        missing_ranges.push(FragRange::new(Some(start), None));
     }
     missing_ranges
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::{Duration, Instant};
-
-    use zenoh::{
-        key_expr::KeyExpr,
-        sample::{FragInfo, Sample, SampleBuilder},
-    };
-
-    use super::{fragment_count, FragInsertError, FragmentedSample, MAX_FRAGMENTS_DEFAULT};
-
-    const ZERO: Duration = Duration::ZERO;
-
-    fn make_sample(payload: &str, frag_num: u32, frag_count: u32) -> Sample {
-        SampleBuilder::put(KeyExpr::try_from("test/key").unwrap(), payload)
-            .frag_info(FragInfo::new(frag_count, frag_num))
-            .into()
-    }
-
-    #[test]
-    fn out_of_order_insert_completes() {
-        let s0 = make_sample("A", 0, 3);
-        let s1 = make_sample("B", 1, 3);
-        let s2 = make_sample("C", 2, 3);
-
-        let mut fs =
-            FragmentedSample::from_first_fragment(s2, 2, 3, MAX_FRAGMENTS_DEFAULT).unwrap();
-        assert!(!fs.is_complete());
-        fs.insert(s1, 1, 3).unwrap();
-        assert!(!fs.is_complete());
-        fs.insert(s0, 0, 3).unwrap();
-        assert!(fs.is_complete());
-
-        let sample = fs.into_sample().unwrap();
-        assert_eq!(sample.payload().try_to_string().unwrap().as_ref(), "ABC");
-    }
-
-    #[test]
-    fn invalid_frag_num_ge_count() {
-        let s = make_sample("A", 5, 3);
-        assert!(matches!(
-            FragmentedSample::from_first_fragment(s, 5, 3, MAX_FRAGMENTS_DEFAULT),
-            Err(FragInsertError::InvalidFragNum {
-                frag_count: 3,
-                frag_num: 5,
-            })
-        ));
-    }
-
-    #[test]
-    fn invalid_frag_count_zero() {
-        let s = make_sample("A", 0, 0);
-        assert!(matches!(
-            FragmentedSample::from_first_fragment(s, 0, 0, MAX_FRAGMENTS_DEFAULT),
-            Err(FragInsertError::InvalidFragCount { frag_count: 0 })
-        ));
-    }
-
-    #[test]
-    fn exceeds_max() {
-        let s = make_sample("A", 0, 5000);
-        assert!(matches!(
-            FragmentedSample::from_first_fragment(s, 0, 5000, MAX_FRAGMENTS_DEFAULT),
-            Err(FragInsertError::ExceedsMax {
-                frag_count: 5000,
-                max: 4096,
-            })
-        ));
-    }
-
-    #[test]
-    fn from_complete_vec_empty() {
-        let fs = FragmentedSample::from_complete_vec(Vec::new());
-        assert!(!fs.is_complete());
-        assert!(fs.into_sample().is_none());
-    }
-
-    #[test]
-    fn from_complete_vec_single() {
-        let s = make_sample("A", 0, 1);
-        let fs = FragmentedSample::from_complete_vec(vec![s]);
-        assert!(fs.is_complete());
-        assert_eq!(
-            fs.into_sample()
-                .unwrap()
-                .payload()
-                .try_to_string()
-                .unwrap()
-                .as_ref(),
-            "A"
-        );
-    }
-
-    #[test]
-    fn from_complete_vec_multi() {
-        let s0 = make_sample("A", 0, 3);
-        let s1 = make_sample("B", 1, 3);
-        let s2 = make_sample("C", 2, 3);
-        let fs = FragmentedSample::from_complete_vec(vec![s0, s1, s2]);
-        assert!(fs.is_complete());
-        assert_eq!(
-            fs.into_sample()
-                .unwrap()
-                .payload()
-                .try_to_string()
-                .unwrap()
-                .as_ref(),
-            "ABC"
-        );
-    }
-
-    #[test]
-    fn missing_ranges() {
-        let s0 = make_sample("A", 0, 5);
-        let s2 = make_sample("C", 2, 5);
-        let s4 = make_sample("E", 4, 5);
-        let mut fs =
-            FragmentedSample::from_first_fragment(s0, 0, 5, MAX_FRAGMENTS_DEFAULT).unwrap();
-        fs.insert(s2, 2, 5).unwrap();
-        fs.insert(s4, 4, 5).unwrap();
-        let (ranges, _) = fs.clone().prepare_recovery(ZERO, true).unwrap();
-        assert_eq!(ranges, vec![(Some(1), Some(1)), (Some(3), Some(3))]);
-
-        // Without a tail, the live and scan paths select the same holes.
-        assert_eq!(
-            fs.prepare_recovery(ZERO, false).unwrap().0,
-            vec![(Some(1), Some(1)), (Some(3), Some(3))]
-        );
-    }
-
-    #[test]
-    fn missing_holes_and_tail() {
-        // Fragments 0, 1 and 3 of 5 received: hole at 2, tail at 4.
-        let s0 = make_sample("A", 0, 5);
-        let s1 = make_sample("B", 1, 5);
-        let s3 = make_sample("D", 3, 5);
-        let mut fs =
-            FragmentedSample::from_first_fragment(s0, 0, 5, MAX_FRAGMENTS_DEFAULT).unwrap();
-        fs.insert(s1, 1, 5).unwrap();
-        fs.insert(s3, 3, 5).unwrap();
-        assert_eq!(
-            fs.clone().prepare_recovery(ZERO, false).unwrap().0,
-            vec![(Some(2), Some(2))]
-        );
-        assert_eq!(
-            fs.clone().prepare_recovery(ZERO, true).unwrap().0,
-            vec![(Some(2), Some(2)), (Some(4), None)]
-        );
-        // An active tail is excluded even on scan ticks.
-        assert_eq!(
-            fs.prepare_recovery(Duration::from_secs(3600), true)
-                .unwrap()
-                .0,
-            vec![(Some(2), Some(2))]
-        );
-    }
-
-    #[test]
-    fn duplicate_fragments_do_not_postpone_tail_recovery() {
-        let delay = Duration::from_secs(60);
-        let stalled = Instant::now() - delay;
-        let mut fs = FragmentedSample::from_first_fragment(
-            make_sample("A", 0, 3),
-            0,
-            3,
-            MAX_FRAGMENTS_DEFAULT,
-        )
-        .unwrap();
-        let FragmentedSample::Partial { last_progress, .. } = &mut fs else {
-            panic!("expected partial assembly");
-        };
-        *last_progress = stalled;
-
-        for _ in 0..5 {
-            fs.insert(make_sample("X", 0, 3), 0, 3).unwrap();
-            let FragmentedSample::Partial { last_progress, .. } = &fs else {
-                panic!("expected partial assembly");
-            };
-            assert_eq!(*last_progress, stalled);
-            assert_eq!(
-                fs.clone().prepare_recovery(delay, true).unwrap().0,
-                vec![(Some(1), None)]
-            );
-        }
-    }
-
-    #[test]
-    fn new_fragment_postpones_tail_recovery() {
-        let delay = Duration::from_secs(60);
-        let stalled = Instant::now() - delay;
-        let mut fs = FragmentedSample::from_first_fragment(
-            make_sample("A", 0, 3),
-            0,
-            3,
-            MAX_FRAGMENTS_DEFAULT,
-        )
-        .unwrap();
-        let FragmentedSample::Partial { last_progress, .. } = &mut fs else {
-            panic!("expected partial assembly");
-        };
-        *last_progress = stalled;
-
-        fs.insert(make_sample("B", 1, 3), 1, 3).unwrap();
-        let FragmentedSample::Partial { last_progress, .. } = &fs else {
-            panic!("expected partial assembly");
-        };
-        assert!(*last_progress > stalled);
-        assert!(fs.prepare_recovery(delay, true).is_none());
-        assert_eq!(
-            fs.prepare_recovery(ZERO, true).unwrap().0,
-            vec![(Some(2), None)]
-        );
-    }
-
-    #[test]
-    fn recovery_is_exclusive_and_preserves_unrequested_tail() {
-        let mut fs = FragmentedSample::from_first_fragment(
-            make_sample("A", 0, 5),
-            0,
-            5,
-            MAX_FRAGMENTS_DEFAULT,
-        )
-        .unwrap();
-        fs.insert(make_sample("D", 3, 5), 3, 5).unwrap();
-        let (ranges, token) = fs.prepare_recovery(ZERO, false).unwrap();
-        fs.insert(make_sample("B", 1, 5), 1, 5).unwrap();
-        assert!(fs.prepare_recovery(ZERO, true).is_none());
-        fs.insert(make_sample("C", 2, 5), 2, 5).unwrap();
-        assert!(!fs.finish_recovery(&token, &ranges));
-        assert!(fs.is_incomplete());
-        assert_eq!(
-            fs.prepare_recovery(ZERO, true).unwrap().0,
-            vec![(Some(4), None)]
-        );
-    }
-
-    #[test]
-    fn failed_recovery_preserves_fragments_and_enforces_cooldown() {
-        let mut fs = FragmentedSample::from_first_fragment(
-            make_sample("A", 0, 4),
-            0,
-            4,
-            MAX_FRAGMENTS_DEFAULT,
-        )
-        .unwrap();
-        // Missing middle fragments are queryable immediately. Only the retry
-        // cooldown can prevent another attempt; the tail delay is irrelevant.
-        fs.insert(make_sample("D", 3, 4), 3, 4).unwrap();
-        let (ranges, token) = fs.prepare_recovery(ZERO, false).unwrap();
-        assert_eq!(ranges, vec![(Some(1), Some(2))]);
-        fs.insert(make_sample("B", 1, 4), 1, 4).unwrap();
-        assert!(fs.finish_recovery(&token, &ranges));
-        assert!(!fs.is_abandoned());
-        assert!(fs.is_incomplete());
-        assert!(fs.can_abandon());
-        assert!(fs
-            .prepare_recovery(Duration::from_secs(60), false)
-            .is_none());
-        assert!(!fs.recovery_matches(&token));
-        // Duplicates do not erase failure or bypass the cooldown.
-        fs.insert(make_sample("A", 0, 4), 0, 4).unwrap();
-        assert!(fs.can_abandon());
-        assert!(fs
-            .prepare_recovery(Duration::from_secs(60), false)
-            .is_none());
-        fs.insert(make_sample("C", 2, 4), 2, 4).unwrap();
-        assert!(fs.is_complete());
-        assert!(!fs.can_abandon());
-        assert_eq!(
-            fs.into_sample().unwrap().payload().try_to_string().unwrap(),
-            "ABCD"
-        );
-    }
-
-    #[test]
-    fn retry_cooldown_expires_and_stale_attempt_cannot_finish_retry() {
-        let delay = Duration::from_secs(60);
-        let mut fs = FragmentedSample::from_first_fragment(
-            make_sample("A", 0, 3),
-            0,
-            3,
-            MAX_FRAGMENTS_DEFAULT,
-        )
-        .unwrap();
-        fs.insert(make_sample("C", 2, 3), 2, 3).unwrap();
-        let (ranges, first) = fs.prepare_recovery(ZERO, false).unwrap();
-        assert_eq!(ranges, vec![(Some(1), Some(1))]);
-        assert!(fs.finish_recovery(&first, &ranges));
-        assert!(fs.prepare_recovery(delay, false).is_none());
-        let FragmentedSample::Partial { recovery, .. } = &mut fs else {
-            panic!("expected partial assembly");
-        };
-        // Expire only the retry cooldown. No change to last_progress is needed
-        // because the missing middle fragment does not depend on the tail delay.
-        *recovery = super::FragmentRecovery::FailedAt(Instant::now() - delay);
-        let (retry_ranges, retry) = fs.prepare_recovery(delay, false).unwrap();
-        assert_eq!(retry_ranges, ranges);
-        assert!(!fs.can_abandon());
-        assert!(!fs.finish_recovery(&first, &ranges));
-        assert!(fs.recovery_matches(&retry));
-        assert!(fs.prepare_recovery(ZERO, false).is_none());
-    }
-
-    #[test]
-    fn progress_after_failure_earns_a_fresh_attempt() {
-        let mut fs = FragmentedSample::from_first_fragment(
-            make_sample("C", 2, 4),
-            2,
-            4,
-            MAX_FRAGMENTS_DEFAULT,
-        )
-        .unwrap();
-        let (_, attempt) = fs.prepare_recovery(ZERO, false).unwrap();
-        assert!(fs.finish_recovery(&attempt, &[(Some(0), Some(1))]));
-        assert!(fs.can_abandon());
-        fs.insert(make_sample("A", 0, 4), 0, 4).unwrap();
-        assert!(fs.is_incomplete());
-        assert!(!fs.can_abandon());
-        let (_, retry) = fs.prepare_recovery(ZERO, false).unwrap();
-        fs.insert(make_sample("B", 1, 4), 1, 4).unwrap();
-        assert!(!fs.finish_recovery(&retry, &[(Some(1), Some(1))]));
-        assert!(!fs.can_abandon());
-        assert_eq!(
-            fs.prepare_recovery(ZERO, true).unwrap().0,
-            vec![(Some(3), None)]
-        );
-    }
-
-    #[test]
-    fn missing_tail_only() {
-        // Sequential prefix 0, 1, 2 of 5: no hole, tail at 3..
-        let s0 = make_sample("A", 0, 5);
-        let s1 = make_sample("B", 1, 5);
-        let s2 = make_sample("C", 2, 5);
-        let mut fs =
-            FragmentedSample::from_first_fragment(s0, 0, 5, MAX_FRAGMENTS_DEFAULT).unwrap();
-        fs.insert(s1, 1, 5).unwrap();
-        fs.insert(s2, 2, 5).unwrap();
-        assert!(fs.prepare_recovery(ZERO, false).is_none());
-        assert_eq!(
-            fs.prepare_recovery(ZERO, true).unwrap().0,
-            vec![(Some(3), None)]
-        );
-    }
-
-    #[test]
-    fn single_promotion_count_mismatch() {
-        let s = make_sample("A", 0, 1);
-        let mut fs = FragmentedSample::single(s);
-        let s3 = make_sample("B", 0, 3);
-        assert!(matches!(
-            fs.insert(s3, 0, 3),
-            Err(FragInsertError::CountMismatch {
-                expected: 1,
-                got: 3
-            })
-        ));
-    }
-
-    #[test]
-    fn insert_fragment_duplicate_overwrites() {
-        let s0 = make_sample("A", 0, 3);
-        let s0_dup = make_sample("X", 0, 3);
-        let s1 = make_sample("B", 1, 3);
-        let s2 = make_sample("C", 2, 3);
-
-        let mut fs =
-            FragmentedSample::from_first_fragment(s0, 0, 3, MAX_FRAGMENTS_DEFAULT).unwrap();
-        fs.insert(s0_dup, 0, 3).unwrap(); // duplicate, overwrites
-        fs.insert(s1, 1, 3).unwrap();
-        fs.insert(s2, 2, 3).unwrap();
-
-        let sample = fs.into_sample().unwrap();
-        assert_eq!(sample.payload().try_to_string().unwrap().as_ref(), "XBC");
-    }
-
-    #[test]
-    fn insert_single_duplicate_overwrites() {
-        let s = make_sample("A", 0, 1);
-        let mut fs = FragmentedSample::single(s);
-        fs.insert(make_sample("X", 0, 1), 0, 1).unwrap();
-        assert_eq!(
-            fs.into_sample()
-                .unwrap()
-                .payload()
-                .try_to_string()
-                .unwrap()
-                .as_ref(),
-            "X"
-        );
-    }
-
-    #[test]
-    fn fragment_count_exact_division() {
-        assert_eq!(fragment_count(12, 4).unwrap(), 3);
-    }
-
-    #[test]
-    fn fragment_count_leaves_remainder() {
-        assert_eq!(fragment_count(13, 4).unwrap(), 4);
-    }
-
-    #[test]
-    fn fragment_count_fits_even_beyond_default_cap() {
-        // The subscriber-side cap is not enforced here: 4097 fragments exceed
-        // MAX_FRAGMENTS_DEFAULT but are representable on the wire.
-        assert_eq!(
-            fragment_count(MAX_FRAGMENTS_DEFAULT as usize + 1, 1).unwrap(),
-            MAX_FRAGMENTS_DEFAULT + 1
-        );
-    }
-
-    #[test]
-    fn fragment_count_max_u32() {
-        assert_eq!(fragment_count(u32::MAX as usize, 1).unwrap(), u32::MAX);
-    }
-
-    #[test]
-    fn fragment_count_overflow() {
-        assert!(fragment_count(u32::MAX as usize + 1, 1).is_err());
-        assert!(fragment_count(usize::MAX / 2, 1).is_err());
-    }
-}
+mod tests;

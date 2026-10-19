@@ -71,6 +71,10 @@ pub trait SampleBuilderTrait {
 /// fragments by keying slots on `SourceInfo`: fragmented samples without
 /// `SourceInfo` cannot be reassembled and are discarded by
 /// `AdvancedSubscriber`.
+///
+/// This attaches metadata only; it does not split the payload. Fragments of one
+/// publication share the same source identifier, source sequence number, and
+/// fragment count, and each carries its own zero-based fragment index.
 #[zenoh_macros::unstable]
 pub trait FragInfoBuilderTrait {
     /// Attach fragmentation information.

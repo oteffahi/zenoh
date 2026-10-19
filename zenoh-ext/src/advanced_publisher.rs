@@ -36,10 +36,10 @@ use zenoh::{
     liveliness::LivelinessToken,
     pubsub::{
         PublicationBuilder, PublicationBuilderDelete, PublicationBuilderPut, Publisher,
-        PublisherBuilder, PublisherUndeclaration,
+        PublisherBuilder, PublisherPutBuilder, PublisherUndeclaration,
     },
     qos::{CongestionControl, Priority, Reliability},
-    sample::{FragInfo, Locality, SourceInfo},
+    sample::{FragInfo, Locality, Sample, SourceInfo},
     session::EntityGlobalId,
     Resolvable, Resolve, Result as ZResult, Session, Wait, KE_ADV_PREFIX, KE_EMPTY,
 };
@@ -254,11 +254,15 @@ impl<'a, 'b, 'c> AdvancedPublisherBuilder<'a, 'b, 'c> {
     ///
     /// A publication whose payload would require more than `u32::MAX`
     /// fragments errors out at publication time. Fragment caps below that
-    /// are enforced on the subscriber side: most fragments must still comply
+    /// are enforced on the subscriber side: the fragment count must comply
     /// with each [`AdvancedSubscriber`](crate::AdvancedSubscriber)'s
     /// `max_fragments` (default 4096), or that fragment is rejected by that
     /// subscriber. `size` should be chosen so that typical payloads stay
     /// within the receivers' caps.
+    ///
+    /// Once a fragmented publication is prepared, the publisher attempts to send
+    /// every fragment and discards individual send errors. Preparation errors, including
+    /// fragment-count overflow, are still returned to the caller.
     #[zenoh_macros::unstable]
     #[inline]
     pub fn fragmentation(self, size: usize) -> Self {
@@ -344,6 +348,8 @@ impl IntoFuture for AdvancedPublisherBuilder<'_, '_, '_> {
 /// any other method of [`AdvancedPublisherBuilder`](crate::AdvancedPublisherBuilder).
 ///
 /// The `AdvancedPublisher` works with [`AdvancedSubscriber`](crate::AdvancedSubscriber) to provide additional functionalities such as:
+/// - [`fragmentation`](AdvancedPublisherBuilder::fragmentation) of large payloads into independently sent fragments,
+///   reassembled by advanced subscribers and individually recoverable from the cache
 /// - [`cache`](crate::AdvancedPublisherBuilderExt::cache) last published samples to be retrieved by
 ///   [`AdvancedSubscriber`](crate::AdvancedSubscriber)'s [`history`](crate::AdvancedSubscriberBuilderExt::history) mechanism
 /// - [`sample_miss_detection`](crate::AdvancedPublisherBuilderExt::sample_miss_detection) to allow detecting missed samples
@@ -547,6 +553,37 @@ impl<'a> AdvancedPublisher<'a> {
             _token: token,
             _state_publisher: state_publisher,
         })
+    }
+
+    fn set_publication_identity<'b, P>(
+        &self,
+        mut builder: PublicationBuilder<&'b Publisher<'b>, P>,
+        operation: &str,
+    ) -> PublicationBuilder<&'b Publisher<'b>, P> {
+        if let Some(seqnum) = &self.seqnum {
+            let info = Some(SourceInfo::new(
+                self.id(),
+                seqnum.fetch_add(1, Ordering::Relaxed),
+            ));
+            tracing::trace!(
+                "AdvancedPublisher{{key_expr: {}}}: {} data with {:?}",
+                self.key_expr(),
+                operation,
+                info
+            );
+            builder = builder.source_info(info);
+        }
+        builder
+    }
+
+    fn set_publication_timestamp<'b, P>(
+        &self,
+        builder: PublicationBuilder<&'b Publisher<'b>, P>,
+    ) -> PublicationBuilder<&'b Publisher<'b>, P> {
+        match self.publisher.session().hlc() {
+            Some(hlc) => builder.timestamp(hlc.new_timestamp()),
+            None => builder,
+        }
     }
 
     /// Returns the [`EntityGlobalId`] of this Publisher.
@@ -843,77 +880,72 @@ impl<P> Resolvable for AdvancedPublicationBuilder<'_, P> {
     type To = ZResult<()>;
 }
 
+impl<'a> AdvancedPublisherPutBuilder<'a> {
+    fn prepare_fragments(&self, size: usize) -> ZResult<Vec<PublisherPutBuilder<'a>>> {
+        // `to_bytes` is only called if fragmentation is necessary,
+        // to avoid copy for small messages.
+        let bytes = self.builder.payload_ref().to_bytes();
+        // NOTE: this consumes a sequence number even if the
+        // publication is refused, leaving a gap that subscribers will
+        // account for.
+        let frag_count = fragment_count(bytes.len(), size).map_err(|e| {
+            zerror!(
+                "AdvancedPublisher{{key_expr: {}}}: {e}",
+                self.publisher.key_expr()
+            )
+        })?;
+        let mut builders = Vec::with_capacity(frag_count as usize);
+        for (i, chunk) in bytes.chunks(size).enumerate() {
+            let mut builder = self
+                .builder
+                .clone()
+                .payload(chunk)
+                .frag_info(FragInfo::new(frag_count, i as u32));
+            match i {
+                0 => {
+                    // fragment 0 carries timestamp and attachment of original message
+                    builder = self.publisher.set_publication_timestamp(builder);
+                }
+                _ => {
+                    // clear timestamp and attachment for fragments that aren't frag 0
+                    // NOTE: timestamp is cleared here to avoid duplicate HLC clock values
+                    builder = builder.timestamp(None).attachment(None::<ZBytes>);
+                }
+            }
+            builders.push(builder);
+        }
+        Ok(builders)
+    }
+
+    fn send_fragments(builders: impl IntoIterator<Item = impl Wait<To = ZResult<()>>>) {
+        // Attempt every fragment and discard individual send errors. Preparation
+        // errors still propagate before anything is cached or sent.
+        for builder in builders {
+            let _ = builder.wait();
+        }
+    }
+}
+
 #[zenoh_macros::unstable]
 impl Wait for AdvancedPublisherPutBuilder<'_> {
     #[inline]
     #[zenoh_macros::unstable]
     fn wait(mut self) -> <Self as Resolvable>::To {
-        if let Some(seqnum) = &self.publisher.seqnum {
-            let info = Some(SourceInfo::new(
-                self.publisher.id(),
-                seqnum.fetch_add(1, Ordering::Relaxed),
-            ));
-            tracing::trace!(
-                "AdvancedPublisher{{key_expr: {}}}: Put data with {:?}",
-                self.publisher.key_expr(),
-                info
-            );
-            self.builder = self.builder.source_info(info);
-        }
+        self.builder = self.publisher.set_publication_identity(self.builder, "Put");
         if let Some(size) = self.publisher.fragmentation {
-            let payload = self.builder.payload_ref();
-            if payload.len() > size {
-                // `to_bytes` is only called if fragmentation is necessary,
-                // to avoid copy for small messages.
-                let bytes = payload.to_bytes();
-                // NOTE: this consumes a sequence number even if the
-                // publication is refused, leaving a gap that subscribers will
-                // account for.
-                let frag_count = fragment_count(bytes.len(), size).map_err(|e| {
-                    zerror!(
-                        "AdvancedPublisher{{key_expr: {}}}: {e}",
-                        self.publisher.key_expr()
-                    )
-                })?;
-                let chunks = bytes.chunks(size);
-                let mut fragments = vec![];
-                let mut builders = vec![];
-                for (i, chunk) in chunks.enumerate() {
-                    let mut builder = self
-                        .builder
-                        .clone()
-                        .payload(chunk)
-                        .frag_info(FragInfo::new(frag_count, i as u32));
-                    match i {
-                        0 => {
-                            // fragment 0 carries timestamp and attachment of original message
-                            if let Some(hlc) = self.publisher.publisher.session().hlc() {
-                                builder = builder.timestamp(hlc.new_timestamp());
-                            }
-                        }
-                        _ => {
-                            // clear timestamp and attachment for fragments that aren't frag 0
-                            // NOTE: timestamp is cleared here to avoid duplicate HLC clock values
-                            builder = builder.timestamp(None).attachment(None::<ZBytes>);
-                        }
-                    }
-                    fragments.push(zenoh::sample::Sample::from(&builder));
-                    builders.push(builder);
-                }
+            if self.builder.payload_ref().len() > size {
+                let builders = self.prepare_fragments(size)?;
                 if let Some(cache) = self.publisher.cache.as_ref() {
-                    cache.cache_fragments(fragments);
+                    // Cache the complete batch before sending even the first fragment.
+                    cache.cache_fragments(builders.iter().map(Sample::from).collect());
                 }
-                for builder in builders {
-                    let _ = builder.wait();
-                }
+                Self::send_fragments(builders);
                 return Ok(());
             }
         }
-        if let Some(hlc) = self.publisher.publisher.session().hlc() {
-            self.builder = self.builder.timestamp(hlc.new_timestamp());
-        }
+        self.builder = self.publisher.set_publication_timestamp(self.builder);
         if let Some(cache) = self.publisher.cache.as_ref() {
-            cache.cache_sample(zenoh::sample::Sample::from(&self.builder));
+            cache.cache_sample(Sample::from(&self.builder));
         }
         self.builder.wait()
     }
@@ -924,23 +956,10 @@ impl Wait for AdvancedPublisherDeleteBuilder<'_> {
     #[inline]
     #[zenoh_macros::unstable]
     fn wait(mut self) -> <Self as Resolvable>::To {
-        if let Some(seqnum) = &self.publisher.seqnum {
-            let info = Some(SourceInfo::new(
-                self.publisher.id(),
-                seqnum.fetch_add(1, Ordering::Relaxed),
-            ));
-            tracing::trace!(
-                "AdvancedPublisher{{key_expr: {}}}: Del data with {:?}",
-                self.publisher.key_expr(),
-                info
-            );
-            self.builder = self.builder.source_info(info);
-        }
-        if let Some(hlc) = self.publisher.publisher.session().hlc() {
-            self.builder = self.builder.timestamp(hlc.new_timestamp());
-        }
+        self.builder = self.publisher.set_publication_identity(self.builder, "Del");
+        self.builder = self.publisher.set_publication_timestamp(self.builder);
         if let Some(cache) = self.publisher.cache.as_ref() {
-            cache.cache_sample(zenoh::sample::Sample::from(&self.builder));
+            cache.cache_sample(Sample::from(&self.builder));
         }
         self.builder.wait()
     }
@@ -965,5 +984,61 @@ impl IntoFuture for AdvancedPublisherDeleteBuilder<'_> {
     #[zenoh_macros::unstable]
     fn into_future(self) -> Self::IntoFuture {
         std::future::ready(self.wait())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use zenoh::{Config, Resolvable, Result as ZResult, Wait};
+
+    use crate::{AdvancedPublisherBuilderExt, MissDetectionConfig};
+
+    struct FailingFragment<'a> {
+        index: usize,
+        attempts: &'a RefCell<Vec<usize>>,
+    }
+
+    impl Resolvable for FailingFragment<'_> {
+        type To = ZResult<()>;
+    }
+
+    impl Wait for FailingFragment<'_> {
+        fn wait(self) -> Self::To {
+            self.attempts.borrow_mut().push(self.index);
+            Err(zenoh::internal::zerror!("simulated fragment send failure").into())
+        }
+    }
+
+    #[test]
+    fn fragment_send_failures_do_not_stop_later_attempts() {
+        let attempts = RefCell::new(Vec::new());
+        super::AdvancedPublisherPutBuilder::send_fragments((0..3).map(|index| FailingFragment {
+            index,
+            attempts: &attempts,
+        }));
+        assert_eq!(*attempts.borrow(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn fragmented_publication_discards_send_errors() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = zenoh::open(config).wait().unwrap();
+        let publisher = session
+            .declare_publisher("test/advanced_publisher/send_errors")
+            .sample_miss_detection(MissDetectionConfig::default())
+            .fragmentation(2)
+            .wait()
+            .unwrap();
+        session.close().wait().unwrap();
+
+        // Each fragment's underlying publication fails on the closed session,
+        // but the fragmented publication still succeeds after attempting them.
+        publisher.put("abcdef").wait().unwrap();
+        assert!(publisher.put("ab").wait().is_err());
+        assert!(publisher.delete().wait().is_err());
     }
 }

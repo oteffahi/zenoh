@@ -39,10 +39,10 @@ use crate::api::{
 pub type SourceSn = u32;
 
 #[zenoh_macros::unstable]
-/// The total number of fragments for the [`Sample`] fragment.
+/// The total number of fragments in the original publication.
 pub type FragCount = u32;
 
-/// The fragment number of the [`Sample`] fragment.
+/// The zero-based index of a fragment within the original publication.
 #[zenoh_macros::unstable]
 pub type FragNum = u32;
 
@@ -159,6 +159,11 @@ impl<const ID: u8> From<SourceInfo> for zenoh_protocol::zenoh::ext::SourceInfoTy
 /// reassembles fragmented samples by keying slots on
 /// [`SourceInfo`]; fragmented samples without `SourceInfo` cannot be
 /// reassembled and are discarded by `AdvancedSubscriber`.
+///
+/// All fragments of a publication share its source identifier, source sequence
+/// number, and fragment count. Each fragment has a zero-based index less than
+/// that count. The advanced subscriber validates these fields and its configured
+/// fragment limit during reassembly; the base Zenoh API transports the metadata.
 #[zenoh_macros::unstable]
 #[derive(Debug, Clone)]
 pub struct FragInfo {
@@ -182,6 +187,9 @@ impl FragInfo {
 
     #[zenoh_macros::unstable]
     /// Build fragmentation information carrying the timestamp of the original sample.
+    ///
+    /// The timestamp is transported as metadata. Advanced subscribers currently
+    /// still require [`SourceInfo`] to identify and reassemble fragments.
     pub fn new_with_timestamp(
         frag_count: FragCount,
         frag_num: FragNum,
@@ -195,13 +203,13 @@ impl FragInfo {
     }
 
     #[zenoh_macros::unstable]
-    /// The total number of fragments for the [`Sample`] fragment.
+    /// The total number of fragments in the original publication.
     pub fn frag_count(&self) -> FragCount {
         self.frag_count
     }
 
     #[zenoh_macros::unstable]
-    /// The fragment number of the [`Sample`] fragment.
+    /// The zero-based index of this fragment within the original publication.
     pub fn frag_num(&self) -> FragNum {
         self.frag_num
     }
