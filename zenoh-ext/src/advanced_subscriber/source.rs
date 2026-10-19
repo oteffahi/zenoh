@@ -147,9 +147,22 @@ impl SequencedSource {
         context: &ArrivalContext<'_>,
     ) -> Result<ReceiveOutcome, FragInsertError> {
         let sn = info.source_sn().into();
-        let inserted = match self.classify_arrival(sn, context.history_pending) {
+        let arrival = self.classify_arrival(sn, context.history_pending);
+        let is_fragmented = sample.frag_info().is_some();
+        let deliver_directly = !is_fragmented
+            && match arrival {
+                // History depth one delivers whole samples immediately.
+                Arrival::InitialHistory => context.max_pending_samples == 1,
+                // With recovery, even whole samples wait for buffered predecessors.
+                Arrival::FirstOrConsecutive => {
+                    !context.retransmission || self.pending_samples.is_empty()
+                }
+                Arrival::Ahead => !context.retransmission,
+                Arrival::Retired | Arrival::OldOrDuplicate => false,
+            };
+
+        let inserted = match arrival {
             Arrival::Retired => return Ok(ReceiveOutcome::Ignored),
-            Arrival::InitialHistory => self.receive_initial_history(sample, info, context),
             // Delivered duplicates have no assembly left to validate them.
             // Check their advertised metadata before counting them as activity.
             Arrival::OldOrDuplicate => match sample.frag_info() {
@@ -161,9 +174,45 @@ impl SequencedSource {
                 .map(|()| None),
                 None => Ok(None),
             },
-            Arrival::FirstOrConsecutive => self.receive_in_order(sample, info, context),
-            Arrival::Ahead => self.receive_ahead(sample, info, context),
+            _ if deliver_directly => {
+                self.deliver_ready(Some((sn, sample)), &context.delivery);
+                Ok(None)
+            }
+            _ => self
+                .insert_sample(sample, info, context.max_fragments)
+                .map(|inserted| {
+                    (is_fragmented
+                        && (context.retransmission || !matches!(arrival, Arrival::Ahead)))
+                    .then_some(inserted)
+                }),
         };
+
+        if !deliver_directly {
+            match (&arrival, &inserted) {
+                // Invalid history fragments neither enforce the bound nor pop.
+                (Arrival::InitialHistory, Ok(_)) => self.enforce_arrival_limit(context),
+                (Arrival::Ahead, _) if context.retransmission => {
+                    // Ahead arrivals advance BEFORE enforcing the bound, even
+                    // after rejection: a completion can unblock an evicted or failed head.
+                    let ready = self.advance_ready();
+                    self.deliver_ready(ready, &context.delivery);
+                    self.enforce_arrival_limit(context);
+                }
+                (Arrival::FirstOrConsecutive, Ok(_)) | (Arrival::Ahead, _) => {
+                    // In-order arrivals enforce BEFORE advancing delivery.
+                    // Without recovery, ahead fragments also enforce first,
+                    // including rejected fragments, then check their own slot.
+                    self.enforce_arrival_limit(context);
+                    let ready = if context.retransmission {
+                        self.advance_ready()
+                    } else {
+                        self.take_complete(sn).map(|sample| (sn, sample))
+                    };
+                    self.deliver_ready(ready, &context.delivery);
+                }
+                _ => {}
+            }
+        }
         if !context.history_pending {
             self.drain_authorized_samples(
                 context.delivery.callback,
@@ -173,110 +222,6 @@ impl SequencedSource {
             );
         }
         inserted.map(ReceiveOutcome::Accepted)
-    }
-
-    fn receive_initial_history(
-        &mut self,
-        sample: Sample,
-        info: &SourceInfo,
-        context: &ArrivalContext<'_>,
-    ) -> Result<Option<PendingInsertion>, FragInsertError> {
-        if sample.frag_info().is_some() {
-            // Invalid history fragments neither enforce the bound nor pop.
-            let inserted = self.insert_sample(sample, info, context.max_fragments)?;
-            self.enforce_arrival_limit(context);
-            return Ok(Some(inserted));
-        }
-        let sn = info.source_sn().into();
-        if context.max_pending_samples == 1 {
-            // History depth one delivers whole samples immediately.
-            self.deliver_ready(Some((sn, sample)), &context.delivery);
-        } else {
-            self.pending_samples
-                .insert(sn, PendingSample::single(sample));
-            self.enforce_arrival_limit(context);
-        }
-        Ok(None)
-    }
-
-    fn receive_in_order(
-        &mut self,
-        sample: Sample,
-        info: &SourceInfo,
-        context: &ArrivalContext<'_>,
-    ) -> Result<Option<PendingInsertion>, FragInsertError> {
-        let sn = info.source_sn().into();
-        if sample.frag_info().is_some() {
-            let inserted = self.insert_sample(sample, info, context.max_fragments)?;
-            // In-order fragments enforce BEFORE advancing delivery. Eviction
-            // may itself deliver a complete sample or unblock the next one.
-            self.enforce_arrival_limit(context);
-            let ready = if context.retransmission {
-                self.advance_ready()
-            } else {
-                self.take_complete(sn).map(|sample| (sn, sample))
-            };
-            self.deliver_ready(ready, &context.delivery);
-            return Ok(Some(inserted));
-        }
-        if context.retransmission && !self.pending_samples.is_empty() {
-            // Even a whole sample waits for earlier recoverable fragments.
-            self.pending_samples
-                .insert(sn, PendingSample::single(sample));
-            self.enforce_arrival_limit(context);
-            let ready = self.advance_ready();
-            self.deliver_ready(ready, &context.delivery);
-        } else {
-            self.deliver_ready(Some((sn, sample)), &context.delivery);
-        }
-        Ok(None)
-    }
-
-    fn receive_ahead(
-        &mut self,
-        sample: Sample,
-        info: &SourceInfo,
-        context: &ArrivalContext<'_>,
-    ) -> Result<Option<PendingInsertion>, FragInsertError> {
-        if !context.retransmission {
-            return self
-                .receive_ahead_without_recovery(sample, info, context)
-                .map(|()| None);
-        }
-        let inserted = if sample.frag_info().is_some() {
-            self.insert_sample(sample, info, context.max_fragments)
-                .map(Some)
-        } else {
-            self.pending_samples
-                .insert(info.source_sn().into(), PendingSample::single(sample));
-            Ok(None)
-        };
-        // Ahead arrivals advance BEFORE enforcing the bound, including rejected
-        // fragments. A later completion can unblock an evicted or failed head.
-        let ready = self.advance_ready();
-        self.deliver_ready(ready, &context.delivery);
-        self.enforce_arrival_limit(context);
-        inserted
-    }
-
-    fn receive_ahead_without_recovery(
-        &mut self,
-        sample: Sample,
-        info: &SourceInfo,
-        context: &ArrivalContext<'_>,
-    ) -> Result<(), FragInsertError> {
-        let sn = info.source_sn().into();
-        if sample.frag_info().is_some() {
-            // Preserve enforcement and completion checks even after rejection.
-            let inserted = self.insert_sample(sample, info, context.max_fragments);
-            self.enforce_arrival_limit(context);
-            let ready = self.take_complete(sn).map(|sample| (sn, sample));
-            self.deliver_ready(ready, &context.delivery);
-            inserted.map(|_| ())
-        } else {
-            self.deliver_ready(Some((sn, sample)), &context.delivery);
-            Ok(())
-        }
     }
 
     fn enforce_arrival_limit(&mut self, context: &ArrivalContext<'_>) {
