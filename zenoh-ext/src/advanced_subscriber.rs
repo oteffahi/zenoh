@@ -59,10 +59,7 @@ mod queries;
 mod recovery;
 mod runtime;
 mod source;
-use source::{
-    ArrivalContext, DeliveryContext, PendingInsertion, ReceiveOutcome, SequencedSource,
-    TimestampedSource,
-};
+use source::{ArrivalContext, DeliveryContext, ReceiveOutcome, SequencedSource, TimestampedSource};
 
 /// Default bound on the number of samples buffered per source for reordering
 /// and fragment reassembly. Overridable via
@@ -769,14 +766,14 @@ fn handle_sample(states: &mut State, sample: Sample) -> SampleInsertion {
             },
         );
         match outcome {
-            Ok(ReceiveOutcome::Accepted(inserted)) => {
+            Ok(ReceiveOutcome::Accepted { new_fragment_slot }) => {
                 // Keep time and LRU order in sync: only valid activity touches
                 // either, including valid duplicates with no new entry.
                 source.latest_access = Instant::now();
                 states.sequenced_states.promote(&source_id);
                 SampleInsertion {
                     new_source,
-                    new_fragment_slot: inserted == Some(PendingInsertion::NewEntry),
+                    new_fragment_slot,
                 }
             }
             Ok(ReceiveOutcome::Ignored) => SampleInsertion::default(),

@@ -39,18 +39,13 @@ use crate::{
     utils::WrappingSn,
 };
 
-/// Whether insertion created a sequence-number entry. Only a new entry needs to
-/// arm recovery; fragment progress and duplicate handling belong to the assembly.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum PendingInsertion {
-    NewEntry,
-    ExistingEntry,
-}
-
 /// Valid duplicates count as activity even when nothing is inserted. Explicitly
 /// retired input does not; malformed fragments are returned as validation errors.
 pub(super) enum ReceiveOutcome {
-    Accepted(Option<PendingInsertion>),
+    Accepted {
+        /// A new fragment slot that can arm recovery, not progress within an assembly.
+        new_fragment_slot: bool,
+    },
     Ignored,
 }
 
@@ -138,7 +133,7 @@ impl SequencedSource {
     }
 
     /// Process a sequenced arrival once. Accepted activity is recorded by the
-    /// caller alongside LRU promotion. Its optional insertion describes only
+    /// caller alongside LRU promotion. The `new_fragment_slot` flag describes only
     /// fragmented input; whole samples never arm fragment recovery.
     pub(super) fn receive(
         &mut self,
@@ -161,7 +156,7 @@ impl SequencedSource {
                 Arrival::Retired | Arrival::OldOrDuplicate => false,
             };
 
-        let inserted = match arrival {
+        let new_fragment_slot = match arrival {
             Arrival::Retired => return Ok(ReceiveOutcome::Ignored),
             // Delivered duplicates have no assembly left to validate them.
             // Check their advertised metadata before counting them as activity.
@@ -171,24 +166,24 @@ impl SequencedSource {
                     fi.frag_count(),
                     context.max_fragments,
                 )
-                .map(|()| None),
-                None => Ok(None),
+                .map(|()| false),
+                None => Ok(false),
             },
             _ if deliver_directly => {
                 self.deliver_ready(Some((sn, sample)), &context.delivery);
-                Ok(None)
+                Ok(false)
             }
             _ => self
                 .insert_sample(sample, info, context.max_fragments)
-                .map(|inserted| {
-                    (is_fragmented
-                        && (context.retransmission || !matches!(arrival, Arrival::Ahead)))
-                    .then_some(inserted)
+                .map(|new_entry| {
+                    new_entry
+                        && is_fragmented
+                        && (context.retransmission || !matches!(arrival, Arrival::Ahead))
                 }),
         };
 
         if !deliver_directly {
-            match (&arrival, &inserted) {
+            match (&arrival, &new_fragment_slot) {
                 // Invalid history fragments neither enforce the bound nor pop.
                 (Arrival::InitialHistory, Ok(_)) => self.enforce_arrival_limit(context),
                 (Arrival::Ahead, _) if context.retransmission => {
@@ -221,7 +216,7 @@ impl SequencedSource {
                 context.retransmission,
             );
         }
-        inserted.map(ReceiveOutcome::Accepted)
+        new_fragment_slot.map(|new_fragment_slot| ReceiveOutcome::Accepted { new_fragment_slot })
     }
 
     fn enforce_arrival_limit(&mut self, context: &ArrivalContext<'_>) {
@@ -249,27 +244,21 @@ impl SequencedSource {
         }
     }
 
-    /// Add a sample or fragment to the buffer. Return validation errors to the
-    /// arrival boundary, which logs each rejection once.
+    /// Add a sample or fragment to the buffer. Return whether a sequence-number
+    /// entry was created. Validation errors go to the arrival boundary, which
+    /// logs each rejection once.
     pub(super) fn insert_sample(
         &mut self,
         sample: Sample,
         source_info: &SourceInfo,
         max_fragments: u32,
-    ) -> Result<PendingInsertion, FragInsertError> {
+    ) -> Result<bool, FragInsertError> {
         let sn = source_info.source_sn().into();
         let Some(fi) = sample.frag_info() else {
-            return Ok(
-                if self
-                    .pending_samples
-                    .insert(sn, PendingSample::single(sample))
-                    .is_none()
-                {
-                    PendingInsertion::NewEntry
-                } else {
-                    PendingInsertion::ExistingEntry
-                },
-            );
+            return Ok(self
+                .pending_samples
+                .insert(sn, PendingSample::single(sample))
+                .is_none());
         };
         let (frag_num, frag_count) = (fi.frag_num(), fi.frag_count());
         self.insert_fragment(sample, sn, frag_num, frag_count, max_fragments)
@@ -282,7 +271,7 @@ impl SequencedSource {
         frag_num: u32,
         frag_count: u32,
         max_fragments: u32,
-    ) -> Result<PendingInsertion, FragInsertError> {
+    ) -> Result<bool, FragInsertError> {
         validate_fragment_metadata(frag_num, frag_count, max_fragments)?;
         match self.pending_samples.entry(sn) {
             btree_map::Entry::Vacant(entry) => {
@@ -293,11 +282,11 @@ impl SequencedSource {
                     max_fragments,
                 )?;
                 entry.insert(pending);
-                Ok(PendingInsertion::NewEntry)
+                Ok(true)
             }
             btree_map::Entry::Occupied(mut entry) => {
                 entry.get_mut().insert(sample, frag_num, frag_count)?;
-                Ok(PendingInsertion::ExistingEntry)
+                Ok(false)
             }
         }
     }
