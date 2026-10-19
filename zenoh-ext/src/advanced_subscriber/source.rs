@@ -349,24 +349,11 @@ impl SequencedSource {
         Some(next)
     }
 
-    /// Select the next complete sample without abandoning or removing anything.
-    pub(super) fn next_ready(&self) -> Option<WrappingSn> {
-        let sn = self.next_expected()?;
-        self.pending_samples.get(&sn)?.is_complete().then_some(sn)
-    }
-
     /// Abandon failed blocking assemblies, then take the next ready sample.
-    /// Selection alone is available through `next_ready`.
     pub(super) fn advance_ready(&mut self) -> Option<(WrappingSn, Sample)> {
         self.abandon_failed_head();
-        let sn = self.next_ready()?;
-        let sample = self
-            .pending_samples
-            .remove(&sn)
-            .expect("selected pending sample exists")
-            .into_sample()
-            .expect("selected pending sample is complete");
-        Some((sn, sample))
+        let sn = self.next_expected()?;
+        self.take_complete(sn).map(|sample| (sn, sample))
     }
 
     /// Give up recovering the oldest incomplete sample if recovery failed and
