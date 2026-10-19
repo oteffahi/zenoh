@@ -308,11 +308,7 @@ impl FragRecoveryAttempt {
         for range in &attempt.ranges {
             let params = seq_num_range.clone()
                 + ";"
-                + &format_range(
-                    "_fn",
-                    range.start.map(Into::into),
-                    range.end.map(Into::into),
-                );
+                + &format_range("_fn", Some(range.start.into()), range.end.map(Into::into));
             let attempt = attempt.clone();
             context.send_query(
                 Selector::from((query_expr.clone(), params)),

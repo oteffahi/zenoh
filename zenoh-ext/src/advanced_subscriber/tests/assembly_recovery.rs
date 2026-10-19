@@ -209,7 +209,7 @@ async fn test_fragment_recovery_tail_survives_duplicate_activity() {
                 .clone()
                 .prepare_recovery(delay, RecoveryTrigger::TimerTick)
                 .map(|(ranges, _)| ranges),
-            Some(vec![FragRange::new(Some(1), None)])
+            Some(vec![FragRange::new(1, None)])
         );
     }
     let query = ztimeout!(cache.recv_async()).unwrap();

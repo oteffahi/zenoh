@@ -453,7 +453,7 @@ async fn test_deferred_flush_overlapping_queries_and_boundary_extension() {
             statesref: fixture.states.clone(),
             generation,
             sn: WrappingSn(1),
-            ranges: vec![FragRange::new(Some(1), None)],
+            ranges: vec![FragRange::new(1, None)],
             attempt,
         };
         if sample_query_first {

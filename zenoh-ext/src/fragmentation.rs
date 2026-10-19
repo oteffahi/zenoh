@@ -55,17 +55,17 @@ pub(crate) fn fragment_count(payload_len: usize, size: usize) -> ZResult<u32> {
 
 /// First and last fragment numbers to request, both included.
 ///
-/// Open bounds use `None`, preserving the recovery query's wire representation.
+/// An open end uses `None`, preserving the recovery query's wire representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FragRange {
-    /// First fragment, or the start of the sample when absent.
-    pub(crate) start: Option<u32>,
+    /// First fragment.
+    pub(crate) start: u32,
     /// Last fragment, or the end of the sample when absent.
     pub(crate) end: Option<u32>,
 }
 
 impl FragRange {
-    pub(crate) const fn new(start: Option<u32>, end: Option<u32>) -> Self {
+    pub(crate) const fn new(start: u32, end: Option<u32>) -> Self {
         Self { start, end }
     }
 }
@@ -345,7 +345,7 @@ impl FragmentAssembly {
             return false;
         }
         let failed = ranges.iter().any(|range| {
-            let start = range.start.unwrap_or(0) as usize;
+            let start = range.start as usize;
             let end = range
                 .end
                 .map(|n| n as usize + 1)
@@ -436,11 +436,11 @@ fn missing_ranges_impl(frags: &[Option<Sample>]) -> Vec<FragRange> {
             continue;
         }
         if let Some(start) = hole_start.take() {
-            missing_ranges.push(FragRange::new(Some(start), Some((i - 1) as u32)));
+            missing_ranges.push(FragRange::new(start, Some((i - 1) as u32)));
         }
     }
     if let Some(start) = hole_start {
-        missing_ranges.push(FragRange::new(Some(start), None));
+        missing_ranges.push(FragRange::new(start, None));
     }
     missing_ranges
 }

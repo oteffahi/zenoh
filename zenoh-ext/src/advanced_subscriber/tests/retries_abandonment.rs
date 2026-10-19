@@ -657,7 +657,7 @@ async fn test_fragment_recovery_ignores_recreated_source() {
             statesref: statesref.clone(),
             generation: source.generation.clone(),
             sn: WrappingSn(1),
-            ranges: vec![FragRange::new(Some(1), None)],
+            ranges: vec![FragRange::new(1, None)],
             attempt,
         }
     };

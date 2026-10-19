@@ -145,10 +145,7 @@ fn missing_ranges() {
     let (ranges, _) = pending.clone().prepare_recovery(ZERO, TimerTick).unwrap();
     assert_eq!(
         ranges,
-        vec![
-            FragRange::new(Some(1), Some(1)),
-            FragRange::new(Some(3), Some(3))
-        ]
+        vec![FragRange::new(1, Some(1)), FragRange::new(3, Some(3))]
     );
 
     // Without a tail, the live and scan paths select the same holes.
@@ -173,14 +170,11 @@ fn missing_holes_and_tail() {
             .prepare_recovery(ZERO, FragmentArrival)
             .unwrap()
             .0,
-        vec![FragRange::new(Some(2), Some(2))]
+        vec![FragRange::new(2, Some(2))]
     );
     assert_eq!(
         pending.clone().prepare_recovery(ZERO, TimerTick).unwrap().0,
-        vec![
-            FragRange::new(Some(2), Some(2)),
-            FragRange::new(Some(4), None)
-        ]
+        vec![FragRange::new(2, Some(2)), FragRange::new(4, None)]
     );
     // An active tail is excluded even on scan ticks.
     assert_eq!(
@@ -188,7 +182,7 @@ fn missing_holes_and_tail() {
             .prepare_recovery(Duration::from_secs(3600), TimerTick)
             .unwrap()
             .0,
-        vec![FragRange::new(Some(2), Some(2))]
+        vec![FragRange::new(2, Some(2))]
     );
 }
 
@@ -216,7 +210,7 @@ fn duplicate_fragments_do_not_postpone_tail_recovery() {
                 .prepare_recovery(delay, TimerTick)
                 .unwrap()
                 .0,
-            vec![FragRange::new(Some(1), None)]
+            vec![FragRange::new(1, None)]
         );
     }
 }
@@ -241,7 +235,7 @@ fn new_fragment_postpones_tail_recovery() {
     assert!(pending.prepare_recovery(delay, TimerTick).is_none());
     assert_eq!(
         pending.prepare_recovery(ZERO, TimerTick).unwrap().0,
-        vec![FragRange::new(Some(2), None)]
+        vec![FragRange::new(2, None)]
     );
 }
 
@@ -260,7 +254,7 @@ fn recovery_is_exclusive_and_preserves_unrequested_tail() {
     assert!(!pending.is_retry());
     assert_eq!(
         pending.prepare_recovery(ZERO, TimerTick).unwrap().0,
-        vec![FragRange::new(Some(4), None)]
+        vec![FragRange::new(4, None)]
     );
 }
 
@@ -273,7 +267,7 @@ fn failed_recovery_preserves_fragments_and_enforces_cooldown() {
     // cooldown can prevent another attempt; the tail delay is irrelevant.
     pending.insert(make_sample("D", 3, 4), 3, 4).unwrap();
     let (ranges, token) = pending.prepare_recovery(ZERO, FragmentArrival).unwrap();
-    assert_eq!(ranges, vec![FragRange::new(Some(1), Some(2))]);
+    assert_eq!(ranges, vec![FragRange::new(1, Some(2))]);
     pending.insert(make_sample("B", 1, 4), 1, 4).unwrap();
     assert!(pending.finish_recovery(&token, &ranges));
     assert!(!pending.is_abandoned());
@@ -312,7 +306,7 @@ fn retry_cooldown_expires_and_stale_attempt_cannot_finish_retry() {
             .unwrap();
     pending.insert(make_sample("C", 2, 3), 2, 3).unwrap();
     let (ranges, first) = pending.prepare_recovery(ZERO, FragmentArrival).unwrap();
-    assert_eq!(ranges, vec![FragRange::new(Some(1), Some(1))]);
+    assert_eq!(ranges, vec![FragRange::new(1, Some(1))]);
     assert!(pending.finish_recovery(&first, &ranges));
     assert!(pending.prepare_recovery(delay, FragmentArrival).is_none());
     let PendingSample::Fragmented(FragmentAssembly { recovery, .. }) = &mut pending else {
@@ -336,7 +330,7 @@ fn progress_after_failure_earns_a_fresh_attempt() {
         PendingSample::from_first_fragment(make_sample("C", 2, 4), 2, 4, MAX_FRAGMENTS_DEFAULT)
             .unwrap();
     let (ranges, attempt) = pending.prepare_recovery(ZERO, FragmentArrival).unwrap();
-    assert_eq!(ranges, vec![FragRange::new(Some(0), Some(1))]);
+    assert_eq!(ranges, vec![FragRange::new(0, Some(1))]);
     assert!(pending.finish_recovery(&attempt, &ranges));
     assert!(pending.can_abandon());
     pending.insert(make_sample("A", 0, 4), 0, 4).unwrap();
@@ -347,13 +341,13 @@ fn progress_after_failure_earns_a_fresh_attempt() {
         .prepare_recovery(Duration::from_secs(60), FragmentArrival)
         .is_none());
     let (ranges, retry) = pending.prepare_recovery(ZERO, FragmentArrival).unwrap();
-    assert_eq!(ranges, vec![FragRange::new(Some(1), Some(1))]);
+    assert_eq!(ranges, vec![FragRange::new(1, Some(1))]);
     pending.insert(make_sample("B", 1, 4), 1, 4).unwrap();
     assert!(!pending.finish_recovery(&retry, &ranges));
     assert!(!pending.can_abandon());
     assert_eq!(
         pending.prepare_recovery(ZERO, TimerTick).unwrap().0,
-        vec![FragRange::new(Some(3), None)]
+        vec![FragRange::new(3, None)]
     );
 }
 
@@ -369,7 +363,7 @@ fn missing_tail_only() {
     assert!(pending.prepare_recovery(ZERO, FragmentArrival).is_none());
     assert_eq!(
         pending.prepare_recovery(ZERO, TimerTick).unwrap().0,
-        vec![FragRange::new(Some(3), None)]
+        vec![FragRange::new(3, None)]
     );
 }
 
@@ -460,14 +454,13 @@ fn complete_assembly_retains_fragments_and_recovery_until_delivery() {
 }
 
 #[test]
-fn recovery_ranges_preserve_inclusive_and_open_bounds() {
+fn recovery_ranges_preserve_inclusive_bounds_and_open_tail() {
     let mut pending =
         PendingSample::from_first_fragment(make_sample("C", 2, 4), 2, 4, MAX_FRAGMENTS_DEFAULT)
             .unwrap();
-    let (mut ranges, token) = pending.prepare_recovery(ZERO, FragmentArrival).unwrap();
-    assert_eq!(ranges, vec![FragRange::new(Some(0), Some(1))]);
-    // An open start is equivalent to fragment zero. The end remains inclusive.
-    ranges[0].start = None;
+    let (ranges, token) = pending.prepare_recovery(ZERO, FragmentArrival).unwrap();
+    assert_eq!(ranges, vec![FragRange::new(0, Some(1))]);
+    // The prefix starts at fragment zero and includes its end.
     pending.insert(make_sample("A", 0, 4), 0, 4).unwrap();
     assert!(pending.finish_recovery(&token, &ranges));
 
@@ -478,7 +471,7 @@ fn recovery_ranges_preserve_inclusive_and_open_bounds() {
     assert!(!pending.is_retry());
 
     let (tail, token) = pending.prepare_recovery(ZERO, TimerTick).unwrap();
-    assert_eq!(tail, vec![FragRange::new(Some(3), None)]);
+    assert_eq!(tail, vec![FragRange::new(3, None)]);
     assert!(pending.finish_recovery(&token, &tail));
     let (_, retry) = pending.prepare_recovery(ZERO, TimerTick).unwrap();
     pending.insert(make_sample("D", 3, 4), 3, 4).unwrap();
