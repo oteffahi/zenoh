@@ -268,20 +268,13 @@ impl CacheQuery {
         queue: &VecDeque<CachedPublication>,
         mut reply: impl FnMut(&CachedPublication),
     ) {
-        if self.max == Some(0) {
-            return;
-        }
         let publications = queue
             .iter()
             .filter(|publication| self.matches_publication(publication));
         if let Some(max) = self.max {
-            // Count matching publications, not individual fragments. Keep the
-            // newest matches in a bounded buffer, then reply in ascending order.
-            let mut selected = VecDeque::new();
-            for publication in publications {
-                selected.push_front(publication);
-                selected.truncate(max as usize);
-            }
+            // Count matching publications, not individual fragments. Select the
+            // newest matches, then reply in ascending order.
+            let selected: Vec<_> = publications.rev().take(max as usize).collect();
             for publication in selected.into_iter().rev() {
                 reply(publication);
             }
