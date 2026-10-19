@@ -49,7 +49,7 @@ use crate::{
     z_deserialize,
 };
 
-pub(super) fn declare_publications(
+pub(super) fn declare_data_subscriber(
     session: &Session,
     key_expr: &KeyExpr<'_>,
     origin: Locality,
@@ -60,14 +60,14 @@ pub(super) fn declare_publications(
     session
         .declare_subscriber(key_expr)
         .with(CallbackDrop {
-            callback: move |sample| on_publication(&publications, sample),
-            drop: move || on_undeclared(&undeclared),
+            callback: move |sample| on_data_sample(&publications, sample),
+            drop: move || on_data_subscriber_undeclare(&undeclared),
         })
         .allowed_origin(origin)
         .wait()
 }
 
-fn on_publication(statesref: &Arc<Mutex<State>>, sample: Sample) {
+fn on_data_sample(statesref: &Arc<Mutex<State>>, sample: Sample) {
     let mut lock = zlock!(statesref);
     let states = &mut *lock;
     let source_info = sample.source_info().cloned();
@@ -110,13 +110,13 @@ fn on_publication(statesref: &Arc<Mutex<State>>, sample: Sample) {
 }
 
 /// Closing the underlying subscriber must drop the callback to close the receiver.
-fn on_undeclared(statesref: &Mutex<State>) {
+fn on_data_subscriber_undeclare(statesref: &Mutex<State>) {
     let mut states = statesref.lock().unwrap();
     states.callback.take();
     states.miss_handlers.clear();
 }
 
-pub(super) fn query_history(
+pub(super) fn send_initial_history_query(
     statesref: &Arc<Mutex<State>>,
     key_expr: &KeyExpr<'_>,
     history: &HistoryConfig,
@@ -132,7 +132,7 @@ pub(super) fn query_history(
     );
 }
 
-pub(super) fn declare_liveliness(
+pub(super) fn declare_source_liveliness_subscriber(
     session: &Session,
     key_expr: &KeyExpr<'_>,
     statesref: &Arc<Mutex<State>>,
@@ -150,11 +150,11 @@ pub(super) fn declare_liveliness(
         .liveliness()
         .declare_subscriber(key_expr / KE_ADV_PREFIX / KE_PUB / KE_STARSTAR)
         .history(true)
-        .callback(move |sample| on_liveliness(&statesref, &context, &history, sample))
+        .callback(move |sample| on_source_liveliness(&statesref, &context, &history, sample))
         .wait()
 }
 
-fn on_liveliness(
+fn on_source_liveliness(
     statesref: &Arc<Mutex<State>>,
     context: &QueryContext,
     history: &HistoryConfig,
@@ -170,9 +170,9 @@ fn on_liveliness(
     // TODO: For an already known source, query only the appropriate range.
     if let Ok(zid) = ZenohId::from_str(parsed.zid().as_str()) {
         if parsed.eid() == KE_UHLC {
-            on_timestamped_liveliness(statesref, context, history, &sample, zid);
+            on_timestamped_source_liveliness(statesref, context, history, &sample, zid);
         } else if let Ok(eid) = EntityId::from_str(parsed.eid().as_str()) {
-            on_sequenced_liveliness(
+            on_sequenced_source_liveliness(
                 statesref,
                 context,
                 history,
@@ -200,7 +200,7 @@ fn on_liveliness(
     }
 }
 
-fn on_timestamped_liveliness(
+fn on_timestamped_source_liveliness(
     statesref: &Arc<Mutex<State>>,
     context: &QueryContext,
     history: &HistoryConfig,
@@ -241,7 +241,7 @@ fn on_timestamped_liveliness(
     );
 }
 
-fn on_sequenced_liveliness(
+fn on_sequenced_source_liveliness(
     statesref: &Arc<Mutex<State>>,
     context: &QueryContext,
     history: &HistoryConfig,
@@ -288,7 +288,7 @@ fn on_sequenced_liveliness(
     );
 }
 
-pub(super) fn declare_heartbeat(
+pub(super) fn declare_source_heartbeat_subscriber(
     session: &Session,
     key_expr: &KeyExpr<'_>,
     origin: Locality,
@@ -303,12 +303,12 @@ pub(super) fn declare_heartbeat(
     );
     session
         .declare_subscriber(heartbeat_key)
-        .callback(move |sample| on_heartbeat(&statesref, sample))
+        .callback(move |sample| on_source_heartbeat(&statesref, sample))
         .allowed_origin(origin)
         .wait()
 }
 
-fn on_heartbeat(statesref: &Arc<Mutex<State>>, sample: Sample) {
+fn on_source_heartbeat(statesref: &Arc<Mutex<State>>, sample: Sample) {
     if sample.kind() != SampleKind::Put {
         return;
     }
@@ -367,7 +367,7 @@ fn on_heartbeat(statesref: &Arc<Mutex<State>>, sample: Sample) {
     }
 }
 
-pub(super) fn declare_token(
+pub(super) fn declare_subscriber_liveliness_token(
     session: &Session,
     key_expr: &KeyExpr<'_>,
     subscriber: &Subscriber<()>,
@@ -392,7 +392,7 @@ pub(super) fn declare_token(
         .liveliness()
         .declare_token(key_expr / &suffix)
         .wait()?;
-    zlock!(statesref).token = Some(token);
+    zlock!(statesref).subscriber_liveliness_token = Some(token);
     Ok(())
 }
 

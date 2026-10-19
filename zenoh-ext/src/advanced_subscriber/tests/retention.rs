@@ -25,7 +25,7 @@ use zenoh::{
     Config, Session,
 };
 
-use super::{garbage_collect, on_publication};
+use super::{garbage_collect, on_data_sample};
 use crate::{
     advanced_subscriber::{tests::frag_recovery_state, State},
     fragmentation::PendingSample,
@@ -93,7 +93,7 @@ impl Fixture {
 
     fn publish(&self, sample: Sample) {
         // Exercise the real callback, including its post-arrival recovery lookup.
-        on_publication(&self.states, sample);
+        on_data_sample(&self.states, sample);
     }
 
     /// Restore a known LRU/time order without waiting for retention to elapse.

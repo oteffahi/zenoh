@@ -86,7 +86,7 @@ pub(super) fn frag_recovery_state(
             received.lock().unwrap().push(sample)
         })),
         miss_handlers: HashMap::new(),
-        token: None,
+        subscriber_liveliness_token: None,
         _gc_task: AbortOnDropHandle::new(ZRuntime::Application.spawn(std::future::pending())),
     }))
 }

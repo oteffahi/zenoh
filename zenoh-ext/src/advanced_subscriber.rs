@@ -564,7 +564,7 @@ struct State {
     // subscriber receiver, hence the `Option`.
     callback: Option<Callback<Sample>>,
     miss_handlers: HashMap<usize, Callback<Miss>>,
-    token: Option<LivelinessToken>,
+    subscriber_liveliness_token: Option<LivelinessToken>,
     _gc_task: AbortOnDropHandle<()>,
 }
 
@@ -856,28 +856,33 @@ impl<Handler> AdvancedSubscriber<Handler> {
                 max_fragments: conf.max_fragments,
                 callback: Some(callback),
                 miss_handlers: HashMap::new(),
-                token: None,
+                subscriber_liveliness_token: None,
                 _gc_task: AbortOnDropHandle::new(
                     ZRuntime::Application.spawn(runtime::gc_task(weak.clone(), retention_period)),
                 ),
             })
         });
         let subscriber =
-            runtime::declare_publications(conf.session, &key_expr, conf.origin, &statesref)?;
+            runtime::declare_data_subscriber(conf.session, &key_expr, conf.origin, &statesref)?;
         tracing::debug!("Create AdvancedSubscriber{{key_expr: {}}}", key_expr);
         if let Some(history) = conf.history.as_ref() {
-            runtime::query_history(&statesref, &key_expr, history);
+            runtime::send_initial_history_query(&statesref, &key_expr, history);
         }
         let liveliness_subscriber = conf
             .history
             .as_ref()
             .filter(|history| history.liveliness)
             .map(|history| {
-                runtime::declare_liveliness(conf.session, &key_expr, &statesref, history)
+                runtime::declare_source_liveliness_subscriber(
+                    conf.session,
+                    &key_expr,
+                    &statesref,
+                    history,
+                )
             })
             .transpose()?;
         let heartbeat_subscriber = if retransmission.is_some_and(|r| r.heartbeat) {
-            Some(runtime::declare_heartbeat(
+            Some(runtime::declare_source_heartbeat_subscriber(
                 conf.session,
                 &key_expr,
                 conf.origin,
@@ -887,7 +892,13 @@ impl<Handler> AdvancedSubscriber<Handler> {
             None
         };
         if conf.liveliness {
-            runtime::declare_token(conf.session, &key_expr, &subscriber, &statesref, meta)?;
+            runtime::declare_subscriber_liveliness_token(
+                conf.session,
+                &key_expr,
+                &subscriber,
+                &statesref,
+                meta,
+            )?;
         }
         Ok(AdvancedSubscriber {
             statesref,
