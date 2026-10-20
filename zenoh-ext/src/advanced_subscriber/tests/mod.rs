@@ -268,11 +268,6 @@ fn feed_fragment(
     let context = QueryContext::new(&states);
     drop(states);
     if let Some(request) = request {
-        ZRuntime::Application.spawn(context.fragment_query_task(
-            statesref,
-            source_id,
-            &generation,
-            request,
-        ));
+        context.spawn_fragment_query(statesref, source_id, &generation, request);
     }
 }

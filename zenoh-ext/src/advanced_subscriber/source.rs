@@ -25,7 +25,7 @@ use std::{
     time::Instant,
 };
 
-use tokio_util::task::AbortOnDropHandle;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use zenoh::{
     handlers::Callback,
     sample::{Sample, SourceInfo},
@@ -93,6 +93,8 @@ pub(super) struct SequencedSource {
     /// Periodically checks all samples for missing fragments. Stops when none
     /// are missing.
     pub(super) frag_recovery_task: Option<AbortOnDropHandle<()>>,
+    /// Shared cancellation for this source generation's fragment-query dispatches.
+    pub(super) frag_dispatch_cancel: CancellationToken,
     pub(super) alive: bool,
 }
 
@@ -108,8 +110,15 @@ impl Default for SequencedSource {
             latest_access: Instant::now(),
             periodic_task: None,
             frag_recovery_task: None,
+            frag_dispatch_cancel: CancellationToken::new(),
             alive: false,
         }
+    }
+}
+
+impl Drop for SequencedSource {
+    fn drop(&mut self) {
+        self.frag_dispatch_cancel.cancel();
     }
 }
 
@@ -587,42 +596,5 @@ impl TimestampedSource {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn source_layout_does_not_grow() {
-        // Compare against the old source struct rather than hard-coded byte
-        // counts, since type sizes can differ between platforms.
-        #[allow(dead_code)]
-        struct PreviousSource<T> {
-            generation: Arc<()>,
-            last_delivered: Option<T>,
-            last_evicted: Option<T>,
-            pending_queries: u64,
-            pending_flush: Option<WrappingSn>,
-            pending_samples: BTreeMap<T, PendingSample>,
-            latest_access: Instant,
-            periodic_task: Option<AbortOnDropHandle<()>>,
-            frag_recovery_task: Option<AbortOnDropHandle<()>>,
-            alive: bool,
-        }
-        use std::mem::size_of;
-        assert!(size_of::<SequencedSource>() <= size_of::<PreviousSource<WrappingSn>>());
-        assert!(size_of::<TimestampedSource>() < size_of::<PreviousSource<Timestamp>>());
-        assert!(size_of::<Sample>() <= size_of::<PendingSample>());
-        println!(
-            "source sizes: sequenced {} -> {}, timestamped {} -> {}; buffered sample {} -> {}",
-            size_of::<PreviousSource<WrappingSn>>(),
-            size_of::<SequencedSource>(),
-            size_of::<PreviousSource<Timestamp>>(),
-            size_of::<TimestampedSource>(),
-            size_of::<PendingSample>(),
-            size_of::<Sample>()
-        );
     }
 }

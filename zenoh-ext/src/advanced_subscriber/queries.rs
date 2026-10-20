@@ -28,7 +28,7 @@ use std::{
 
 use uhlc::ID;
 use zenoh::{
-    internal::zlock,
+    internal::{runtime::ZRuntime, zlock},
     key_expr::KeyExpr,
     query::{
         ConsolidationMode, Parameters, QueryTarget, Reply, ReplyKeyExpr, Selector, TimeBound,
@@ -100,22 +100,47 @@ impl QueryContext {
         }
     }
 
-    /// Prepare a task for a query triggered by a received fragment. Send it on
-    /// the application runtime so local queryables cannot re-enter the caller.
+    /// Dispatch a fragment's recovery query on the application runtime,
+    /// with cancellation owned by the source generation that reserved it.
     /// Call this after releasing the state lock.
-    pub(super) fn fragment_query_task(
+    pub(super) fn spawn_fragment_query(
+        self,
+        statesref: &Arc<Mutex<State>>,
+        source_id: EntityGlobalId,
+        generation: &Arc<()>,
+        request: FragmentRequest,
+    ) {
+        ZRuntime::Application
+            .spawn(self.fragment_query_task(statesref, source_id, generation, request));
+    }
+
+    fn fragment_query_task(
         self,
         statesref: &Arc<Mutex<State>>,
         source_id: EntityGlobalId,
         generation: &Arc<()>,
         request: FragmentRequest,
     ) -> impl Future<Output = ()> {
-        // Create the handler before the task starts. If the task is cancelled
-        // before its first poll, dropping the handler still clears its query count.
+        // Create the recovery-attempt guard outside the async block so dropping
+        // an unpolled future still releases its pending-query reservation.
         let attempt = request.into_attempt(statesref, source_id, generation);
+        // Capture cancellation before spawning. Source removal cancels this
+        // token even if the dispatch has not been polled yet.
+        let cancellation = zlock!(statesref)
+            .sequenced_states
+            .peek(&source_id)
+            .filter(|source| Arc::ptr_eq(&source.generation, generation))
+            .map(|source| source.frag_dispatch_cancel.clone());
         async move {
-            let query_expr = self.source_key(source_id);
-            attempt.send_query(&self, &query_expr);
+            let Some(cancellation) = cancellation else {
+                return;
+            };
+            let _ = cancellation
+                .run_until_cancelled_owned(async move {
+                    let query_expr = self.source_key(source_id);
+                    attempt.send_query(&self, &query_expr);
+                })
+                .await;
         }
     }
 

@@ -28,7 +28,7 @@ use uhlc::ID;
 use zenoh::{
     config::ZenohId,
     handlers::CallbackDrop,
-    internal::{runtime::ZRuntime, zlock},
+    internal::zlock,
     key_expr::KeyExpr,
     pubsub::Subscriber,
     query::Selector,
@@ -98,13 +98,7 @@ fn on_data_sample(statesref: &Arc<Mutex<State>>, sample: Sample) {
     let work = work.map(|(request, generation)| (request, generation, QueryContext::new(states)));
     drop(lock);
     if let Some((request, generation, context)) = work {
-        // Build the attempt before spawning so cancellation releases its count.
-        ZRuntime::Application.spawn(context.fragment_query_task(
-            statesref,
-            source_id,
-            &generation,
-            request,
-        ));
+        context.spawn_fragment_query(statesref, source_id, &generation, request);
     }
     RepliesHandler::recover_gap(statesref, source_id);
 }
