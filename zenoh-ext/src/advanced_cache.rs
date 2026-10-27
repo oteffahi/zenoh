@@ -411,7 +411,7 @@ impl AdvancedCache {
     fn cache_publication(&self, publication: CachedPublication) {
         if let Ok(mut queue) = self.cache.write() {
             if queue.len() >= self.max_samples.get() {
-                queue.pop_front();
+                drop(queue.drain(..1));
             }
             queue.push_back(publication);
         } else {
@@ -492,6 +492,36 @@ mod tests {
         );
         assert!(query_cache(&session, "_max=0").is_empty());
         session.close().wait().unwrap();
+    }
+
+    #[test]
+    fn cache_eviction_preserves_recent_whole_and_fragmented_publications() {
+        for depth in [1, 3] {
+            let session = open_session();
+            let publisher = session
+                .declare_publisher(KEY)
+                .cache(CacheConfig::default().max_samples(depth))
+                .sample_miss_detection(MissDetectionConfig::default())
+                .fragmentation(2)
+                .wait()
+                .unwrap();
+            for payload in ["a", "bcde", "fg", "hijkl", "m"] {
+                publisher.put(payload).wait().unwrap();
+            }
+            let expected = if depth == 1 {
+                vec![(4, None)]
+            } else {
+                vec![
+                    (2, None),
+                    (3, Some(0)),
+                    (3, Some(1)),
+                    (3, Some(2)),
+                    (4, None),
+                ]
+            };
+            assert_eq!(query_cache(&session, ""), expected);
+            session.close().wait().unwrap();
+        }
     }
 
     #[test]

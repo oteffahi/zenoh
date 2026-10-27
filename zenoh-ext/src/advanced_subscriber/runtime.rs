@@ -94,13 +94,16 @@ fn on_data_sample(statesref: &Arc<Mutex<State>>, sample: Sample) {
     if inserted.new_source {
         source.periodic_task = RepliesHandler::spawn_periodic(statesref, states.period, source_id);
     }
+    let needs_gap_check = !source.pending_samples.is_empty();
     let work = request.map(|request| (request, source.generation.clone()));
     let work = work.map(|(request, generation)| (request, generation, QueryContext::new(states)));
     drop(lock);
     if let Some((request, generation, context)) = work {
         context.spawn_fragment_query(statesref, source_id, &generation, request);
     }
-    RepliesHandler::recover_gap(statesref, source_id);
+    if needs_gap_check {
+        RepliesHandler::recover_gap(statesref, source_id);
+    }
 }
 
 /// Closing the underlying subscriber must drop the callback to close the receiver.

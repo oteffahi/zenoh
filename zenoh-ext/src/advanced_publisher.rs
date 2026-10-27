@@ -989,11 +989,138 @@ impl IntoFuture for AdvancedPublisherDeleteBuilder<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{cell::RefCell, time::Duration};
 
-    use zenoh::{Config, Resolvable, Result as ZResult, Wait};
+    use zenoh::{
+        internal::traits::SampleBuilderTrait, sample::SampleKind, time::Timestamp, Config,
+        Resolvable, Result as ZResult, Wait,
+    };
 
     use crate::{AdvancedPublisherBuilderExt, MissDetectionConfig};
+
+    #[test]
+    fn deferred_and_cloned_publications_get_identity_when_resolved() {
+        let mut config = Config::default();
+        config.scouting.multicast.set_enabled(Some(false)).unwrap();
+        config.listen.endpoints.set(vec![]).unwrap();
+        let session = zenoh::open(config).wait().unwrap();
+        let key = "test/advanced_publisher/deferred";
+        let subscriber = session.declare_subscriber(key).wait().unwrap();
+        let publisher = session
+            .declare_publisher(key)
+            .sample_miss_detection(MissDetectionConfig::default())
+            .wait()
+            .unwrap();
+
+        let deferred = publisher.put("deferred");
+        let cloned = deferred.clone();
+        let deletion = publisher.delete();
+        publisher.put("first").wait().unwrap();
+        cloned.wait().unwrap();
+        deletion.wait().unwrap();
+        deferred.wait().unwrap();
+
+        for (sn, kind, payload) in [
+            (0, SampleKind::Put, "first"),
+            (1, SampleKind::Put, "deferred"),
+            (2, SampleKind::Delete, ""),
+            (3, SampleKind::Put, "deferred"),
+        ] {
+            let sample = subscriber
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            let info = sample.source_info().unwrap();
+            assert_eq!(*info.source_id(), publisher.id());
+            assert_eq!(info.source_sn(), sn);
+            assert_eq!(sample.kind(), kind);
+            assert_eq!(sample.payload().try_to_string().unwrap(), payload);
+        }
+        assert!(subscriber.try_recv().unwrap().is_none());
+        session.close().wait().unwrap();
+    }
+
+    #[test]
+    fn publication_metadata_survives_whole_fragmented_and_delete_paths() {
+        for timestamping in [false, true] {
+            for fragmentation in [false, true] {
+                let mut config = Config::default();
+                config.scouting.multicast.set_enabled(Some(false)).unwrap();
+                config.listen.endpoints.set(vec![]).unwrap();
+                config
+                    .insert_json5("timestamping/enabled", &timestamping.to_string())
+                    .unwrap();
+                let session = zenoh::open(config).wait().unwrap();
+                let key = "test/advanced_publisher/metadata";
+                let subscriber = session.declare_subscriber(key).wait().unwrap();
+                let mut publisher = session
+                    .declare_publisher(key)
+                    .sample_miss_detection(MissDetectionConfig::default());
+                if fragmentation {
+                    publisher = publisher.fragmentation(2);
+                }
+                let publisher = publisher.wait().unwrap();
+                let timestamp = Timestamp::new(Duration::from_secs(1).into(), session.zid().into());
+
+                for (sn, payload) in ["a", "ab", "abc"].into_iter().enumerate() {
+                    publisher
+                        .put(payload)
+                        .timestamp(timestamp)
+                        .attachment("metadata")
+                        .wait()
+                        .unwrap();
+                    let chunks: Vec<_> = payload
+                        .as_bytes()
+                        .chunks(if fragmentation { 2 } else { payload.len() })
+                        .collect();
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        let sample = subscriber
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(sample.payload().to_bytes().as_ref(), *chunk);
+                        assert_eq!(sample.source_info().unwrap().source_sn(), sn as u32);
+                        assert_eq!(
+                            sample
+                                .frag_info()
+                                .map(|info| (info.frag_num(), info.frag_count())),
+                            (chunks.len() > 1).then_some((index as u32, chunks.len() as u32))
+                        );
+                        if index == 0 {
+                            assert_eq!(
+                                sample.attachment().unwrap().try_to_string().unwrap(),
+                                "metadata"
+                            );
+                            if timestamping {
+                                assert!(sample.timestamp().unwrap() > &timestamp);
+                            } else {
+                                assert_eq!(sample.timestamp(), Some(&timestamp));
+                            }
+                        } else {
+                            assert!(sample.attachment().is_none());
+                            if !timestamping {
+                                assert!(sample.timestamp().is_none());
+                            }
+                        }
+                    }
+                }
+                publisher.delete().timestamp(timestamp).wait().unwrap();
+                let sample = subscriber
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(sample.kind(), SampleKind::Delete);
+                assert_eq!(sample.source_info().unwrap().source_sn(), 3);
+                if timestamping {
+                    assert!(sample.timestamp().unwrap() > &timestamp);
+                } else {
+                    assert_eq!(sample.timestamp(), Some(&timestamp));
+                }
+                assert!(subscriber.try_recv().unwrap().is_none());
+                session.close().wait().unwrap();
+            }
+        }
+    }
 
     struct FailingFragment<'a> {
         index: usize,

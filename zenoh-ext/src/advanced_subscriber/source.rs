@@ -179,7 +179,13 @@ impl SequencedSource {
                 None => Ok(false),
             },
             _ if deliver_directly => {
-                self.deliver_ready(Some((sn, sample)), &context.delivery);
+                self.deliver_and_drain(
+                    sample,
+                    sn,
+                    context.delivery.callback,
+                    context.delivery.miss_handlers,
+                    context.delivery.source_id,
+                );
                 Ok(false)
             }
             _ => self
@@ -415,10 +421,9 @@ impl SequencedSource {
         miss_handlers: &HashMap<usize, Callback<Miss>>,
         source_id: EntityGlobalId,
     ) {
-        let mut ready = Some((source_sn.into(), sample));
-        while let Some((sn, sample)) = ready {
+        self.deliver_one(sample, source_sn.into(), callback, miss_handlers, source_id);
+        while let Some((sn, sample)) = self.advance_ready() {
             self.deliver_one(sample, sn, callback, miss_handlers, source_id);
-            ready = self.advance_ready();
         }
         if !self
             .pending_samples
