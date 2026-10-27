@@ -555,35 +555,26 @@ impl<'a> AdvancedPublisher<'a> {
         })
     }
 
-    fn set_publication_identity<'b, P>(
-        &self,
-        mut builder: PublicationBuilder<&'b Publisher<'b>, P>,
-        operation: &str,
-    ) -> PublicationBuilder<&'b Publisher<'b>, P> {
-        if let Some(seqnum) = &self.seqnum {
-            let info = Some(SourceInfo::new(
-                self.id(),
-                seqnum.fetch_add(1, Ordering::Relaxed),
-            ));
-            tracing::trace!(
-                "AdvancedPublisher{{key_expr: {}}}: {} data with {:?}",
-                self.key_expr(),
-                operation,
-                info
-            );
-            builder = builder.source_info(info);
-        }
-        builder
+    fn publication_identity(&self, operation: &str) -> Option<SourceInfo> {
+        let seqnum = self.seqnum.as_ref()?;
+        let info = Some(SourceInfo::new(
+            self.id(),
+            seqnum.fetch_add(1, Ordering::Relaxed),
+        ));
+        tracing::trace!(
+            "AdvancedPublisher{{key_expr: {}}}: {} data with {:?}",
+            self.key_expr(),
+            operation,
+            info
+        );
+        info
     }
 
-    fn set_publication_timestamp<'b, P>(
-        &self,
-        builder: PublicationBuilder<&'b Publisher<'b>, P>,
-    ) -> PublicationBuilder<&'b Publisher<'b>, P> {
-        match self.publisher.session().hlc() {
-            Some(hlc) => builder.timestamp(hlc.new_timestamp()),
-            None => builder,
-        }
+    fn publication_timestamp(&self) -> Option<uhlc::Timestamp> {
+        self.publisher
+            .session()
+            .hlc()
+            .map(|hlc| hlc.new_timestamp())
     }
 
     /// Returns the [`EntityGlobalId`] of this Publisher.
@@ -881,30 +872,35 @@ impl<P> Resolvable for AdvancedPublicationBuilder<'_, P> {
 }
 
 impl<'a> AdvancedPublisherPutBuilder<'a> {
-    fn prepare_fragments(&self, size: usize) -> ZResult<Vec<PublisherPutBuilder<'a>>> {
+    fn prepare_fragments(
+        publisher: &AdvancedPublisher<'_>,
+        publication: &PublisherPutBuilder<'a>,
+        size: usize,
+    ) -> ZResult<Vec<PublisherPutBuilder<'a>>> {
         // `to_bytes` is only called if fragmentation is necessary,
         // to avoid copy for small messages.
-        let bytes = self.builder.payload_ref().to_bytes();
+        let bytes = publication.payload_ref().to_bytes();
         // NOTE: this consumes a sequence number even if the
         // publication is refused, leaving a gap that subscribers will
         // account for.
         let frag_count = fragment_count(bytes.len(), size).map_err(|e| {
             zerror!(
                 "AdvancedPublisher{{key_expr: {}}}: {e}",
-                self.publisher.key_expr()
+                publisher.key_expr()
             )
         })?;
         let mut builders = Vec::with_capacity(frag_count as usize);
         for (i, chunk) in bytes.chunks(size).enumerate() {
-            let mut builder = self
-                .builder
+            let mut builder = publication
                 .clone()
                 .payload(chunk)
                 .frag_info(FragInfo::new(frag_count, i as u32));
             match i {
                 0 => {
                     // fragment 0 carries timestamp and attachment of original message
-                    builder = self.publisher.set_publication_timestamp(builder);
+                    if let Some(timestamp) = publisher.publication_timestamp() {
+                        builder = builder.timestamp(timestamp);
+                    }
                 }
                 _ => {
                     // clear timestamp and attachment for fragments that aren't frag 0
@@ -930,12 +926,18 @@ impl<'a> AdvancedPublisherPutBuilder<'a> {
 impl Wait for AdvancedPublisherPutBuilder<'_> {
     #[inline]
     #[zenoh_macros::unstable]
-    fn wait(mut self) -> <Self as Resolvable>::To {
-        self.builder = self.publisher.set_publication_identity(self.builder, "Put");
-        if let Some(size) = self.publisher.fragmentation {
-            if self.builder.payload_ref().len() > size {
-                let builders = self.prepare_fragments(size)?;
-                if let Some(cache) = self.publisher.cache.as_ref() {
+    fn wait(self) -> <Self as Resolvable>::To {
+        let Self {
+            publisher,
+            mut builder,
+        } = self;
+        if let Some(info) = publisher.publication_identity("Put") {
+            builder = builder.source_info(info);
+        }
+        if let Some(size) = publisher.fragmentation {
+            if builder.payload_ref().len() > size {
+                let builders = Self::prepare_fragments(publisher, &builder, size)?;
+                if let Some(cache) = publisher.cache.as_ref() {
                     // Cache the complete batch before sending even the first fragment.
                     cache.cache_fragments(builders.iter().map(Sample::from).collect());
                 }
@@ -943,11 +945,13 @@ impl Wait for AdvancedPublisherPutBuilder<'_> {
                 return Ok(());
             }
         }
-        self.builder = self.publisher.set_publication_timestamp(self.builder);
-        if let Some(cache) = self.publisher.cache.as_ref() {
-            cache.cache_sample(Sample::from(&self.builder));
+        if let Some(timestamp) = publisher.publication_timestamp() {
+            builder = builder.timestamp(timestamp);
         }
-        self.builder.wait()
+        if let Some(cache) = publisher.cache.as_ref() {
+            cache.cache_sample(Sample::from(&builder));
+        }
+        builder.wait()
     }
 }
 
@@ -955,13 +959,21 @@ impl Wait for AdvancedPublisherPutBuilder<'_> {
 impl Wait for AdvancedPublisherDeleteBuilder<'_> {
     #[inline]
     #[zenoh_macros::unstable]
-    fn wait(mut self) -> <Self as Resolvable>::To {
-        self.builder = self.publisher.set_publication_identity(self.builder, "Del");
-        self.builder = self.publisher.set_publication_timestamp(self.builder);
-        if let Some(cache) = self.publisher.cache.as_ref() {
-            cache.cache_sample(Sample::from(&self.builder));
+    fn wait(self) -> <Self as Resolvable>::To {
+        let Self {
+            publisher,
+            mut builder,
+        } = self;
+        if let Some(info) = publisher.publication_identity("Del") {
+            builder = builder.source_info(info);
         }
-        self.builder.wait()
+        if let Some(timestamp) = publisher.publication_timestamp() {
+            builder = builder.timestamp(timestamp);
+        }
+        if let Some(cache) = publisher.cache.as_ref() {
+            cache.cache_sample(Sample::from(&builder));
+        }
+        builder.wait()
     }
 }
 
